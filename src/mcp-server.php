@@ -23,9 +23,12 @@ use vielhuber\simplemcp\simplemcp;
 // simplemcp's Dotenv loader throws if the .env is missing — auto-touch an
 // empty one on first boot so the server runs out of the box. Users can
 // later populate MCP_TOKEN by editing the file (template in .env.example).
+// Fail loudly on write errors so the subprocess host gets a clear signal
+// instead of an opaque Dotenv crash downstream.
 $env_path = __DIR__ . '/.env';
-if (!is_file($env_path)) {
-    @file_put_contents($env_path, "MCP_TOKEN=\n");
+if (!is_file($env_path) && @file_put_contents($env_path, "MCP_TOKEN=\n") === false) {
+    fwrite(STDERR, 'ppthelper-mcp-server: failed to create ' . $env_path . ' (check permissions on the src/ directory)' . PHP_EOL);
+    exit(1);
 }
 
 new simplemcp(

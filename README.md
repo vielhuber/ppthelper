@@ -144,4 +144,4 @@ vendor/bin/mcp-server.php
 
 the server speaks both stdio (CLI invocation) and HTTP via [simplemcp](https://github.com/vielhuber/simplemcp). `auth: 'static'` mode expects the bearer token in `MCP_TOKEN`.
 
-the tool exposes `render_deck(markdown, primary_color?, accent_color?, background_color?, text_color?, heading_font?, body_font?, transitions?, animations?, filename?)`. without a `chat_id` the deck lands in the caller's working directory; with one (charly injects it via url placeholder) the deck is written into `/host/data/files/<chat_id>/` so a host worker can attach it to a chat reply.
+the tool exposes `render_deck(markdown, primary_color?, accent_color?, background_color?, text_color?, heading_font?, body_font?, transitions?, animations?, output?)` — same arguments as `ppthelper::render` would take, just spelled flat for json-rpc transport. `output` accepts any absolute or relative path; relative paths resolve against the working directory the server was launched from. omit it to get a tempfile back.
