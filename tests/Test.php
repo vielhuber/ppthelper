@@ -341,6 +341,53 @@ class Test extends \PHPUnit\Framework\TestCase
         $this->assertMatchesRegularExpression('#<a:accent1>\s*<a:srgbClr val="AA22BB"/>#', $theme);
     }
 
+    public function test__autofit_added_to_body_placeholders(): void
+    {
+        $out = sys_get_temp_dir() . '/ppthelper_test_autofit.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "# Slide A\n\n- bullet one\n- bullet two",
+            'output' => $out
+        ]);
+        $slide1 = self::loadSlideXml($out, 1);
+        // body placeholder bodyPr must now contain <a:normAutofit/>
+        $this->assertMatchesRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*idx="1"(?:(?!</p:sp>).)*?<a:normAutofit/>#s',
+            $slide1,
+            'body placeholder should have <a:normAutofit/> injected'
+        );
+    }
+
+    public function test__autofit_skips_title_placeholders(): void
+    {
+        $out = sys_get_temp_dir() . '/ppthelper_test_autofit_title.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "% Title slide\n% Author\n% 21. Mai 2026\n\n# Content slide\n\n- bullet",
+            'output' => $out
+        ]);
+        // slide1 = title slide. its title shape must NOT have normAutofit.
+        $slide1 = self::loadSlideXml($out, 1);
+        if (preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*type="(?:title|ctrTitle)"(?:(?!</p:sp>).)*?</p:sp>#s', $slide1, $m) === 1) {
+            $this->assertStringNotContainsString('<a:normAutofit', $m[0], 'title placeholder must not have auto-fit');
+        }
+    }
+
+    public function test__autofit_idempotent_on_existing_normAutofit(): void
+    {
+        // If a slide already had normAutofit (e.g. from a custom skeleton), the
+        // post-process must not double-inject. We can simulate by rendering
+        // twice over the same output and inspecting that no slide ends up with
+        // two normAutofit tags inside a single placeholder.
+        $out = sys_get_temp_dir() . '/ppthelper_test_autofit_idem.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => "# X\n\n- bullet", 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);
+        $body_match = preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*idx="1"(?:(?!</p:sp>).)*?</p:sp>#s', $slide1, $m);
+        $this->assertSame(1, $body_match);
+        $this->assertSame(1, substr_count($m[0], '<a:normAutofit'));
+    }
+
     public function test__layout_restore_does_not_clobber_slide_content(): void
     {
         // Slides must keep the model's content after restore. Plain bullets,

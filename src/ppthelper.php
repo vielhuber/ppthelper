@@ -131,6 +131,12 @@ class ppthelper
         // the user's master design. Copy them back verbatim from the template.
         self::restoreSkeletonLayouts($output, $template);
 
+        // Pandoc emits content placeholders with a bare <a:bodyPr/> — when a
+        // model writes more bullets than fit, the text overflows the slide.
+        // Adding <a:normAutofit/> tells PowerPoint to shrink text dynamically
+        // so it always stays inside the placeholder.
+        self::enableAutoFitOnBodyPlaceholders($output);
+
         self::validateOutput($output);
 
         // Post-process: transitions + animations.
@@ -158,12 +164,6 @@ class ppthelper
      *     standard Pandoc-Markdown.
      *
      * @param string $markdown The complete deck as one Pandoc-Markdown blob.
-     * @param string|null $primary_color Hex color (e.g. "#1F4E79") for headings and primary accents.
-     * @param string|null $accent_color Hex color (e.g. "#F59E0B") for secondary accents.
-     * @param string|null $background_color Hex color (e.g. "#FFFFFF") for the slide background.
-     * @param string|null $text_color Hex color (e.g. "#111827") for body text.
-     * @param string|null $heading_font Font family for headings, e.g. "Aptos Display", "Inter", "Calibri". ASCII letters/digits/space/dash only, max 64 chars.
-     * @param string|null $body_font Font family for body text, e.g. "Aptos", "Inter", "Calibri".
      * @param string|null $transitions Slide transition applied to every slide. One of: null (none), "fade", "slide".
      * @param bool|null $animations When true, body bullets appear one click at a time (PowerPoint "Appear → By Paragraph").
      * @param string|null $output Output path. Relative paths resolve against the caller's cwd. If null, a tempfile is used and its path returned.
@@ -172,25 +172,18 @@ class ppthelper
     #[McpTool(name: 'render_deck')]
     public function renderDeck(
         string $markdown,
-        ?string $primary_color = null,
-        ?string $accent_color = null,
-        ?string $background_color = null,
-        ?string $text_color = null,
-        ?string $heading_font = null,
-        ?string $body_font = null,
         ?string $transitions = null,
         ?bool $animations = null,
         ?string $output = null
     ): array {
+        // Theme parameters (primary/accent/background/text colors, heading/body fonts)
+        // are intentionally NOT exposed through the MCP interface — LLMs reflexively
+        // fill them with their own "modern default" palette, overwriting the carefully
+        // curated skeleton theme. Callers needing to force a theme can still use the
+        // PHP `render()` entry point or the CLI directly.
         $path = self::render([
             'input_markdown' => $markdown,
             'output' => $output,
-            'colors_primary' => $primary_color,
-            'colors_secondary' => $accent_color,
-            'colors_background' => $background_color,
-            'colors_text' => $text_color,
-            'fonts_heading' => $heading_font,
-            'fonts_text' => $body_font,
             'transitions' => $transitions !== null && $transitions !== '' ? $transitions : false,
             'animations' => (bool) ($animations ?? false)
         ]);
@@ -350,6 +343,81 @@ class ppthelper
         } finally {
             $template_zip->close();
             $output_zip->close();
+        }
+    }
+
+    /**
+     * Walk every slide and add `<a:normAutofit/>` to the `<a:bodyPr>` of body
+     * placeholders. PowerPoint then auto-shrinks oversized text instead of
+     * letting it overflow the slide. Title placeholders are NOT touched —
+     * shrinking titles silently makes for inconsistent decks.
+     */
+    private static function enableAutoFitOnBodyPlaceholders(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for auto-fit pass: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $new_xml = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m): string {
+                        $sp = $m[0];
+                        // skip title/subTitle placeholders — shrinking titles silently looks bad
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle)"#', $sp) === 1) {
+                            return $sp;
+                        }
+                        // only touch body-style placeholders: type="body"/"obj" or no type with idx="1"
+                        if (preg_match('#<p:ph\b([^/]*)/?>#', $sp, $ph_m) !== 1) {
+                            return $sp;
+                        }
+                        $ph_attrs = $ph_m[1];
+                        $type = preg_match('#\btype="([^"]+)"#', $ph_attrs, $tm) === 1 ? $tm[1] : '';
+                        $has_idx_1 = preg_match('#\bidx="1"#', $ph_attrs) === 1;
+                        $is_body = in_array($type, ['body', 'obj'], true) || ($type === '' && $has_idx_1);
+                        if (!$is_body) {
+                            return $sp;
+                        }
+                        if (str_contains($sp, '<a:normAutofit')) {
+                            return $sp;
+                        }
+                        // <a:bodyPr/> → <a:bodyPr><a:normAutofit/></a:bodyPr>
+                        $patched = preg_replace(
+                            '#<a:bodyPr(\s[^/>]*)?\s*/>#',
+                            '<a:bodyPr$1><a:normAutofit/></a:bodyPr>',
+                            $sp,
+                            1
+                        );
+                        // <a:bodyPr ...>...</a:bodyPr> with inner content → keep inner + append normAutofit
+                        if ($patched === $sp) {
+                            $patched = preg_replace(
+                                '#(<a:bodyPr(?:\s[^>]*)?>)(.*?)(</a:bodyPr>)#s',
+                                '$1$2<a:normAutofit/>$3',
+                                $sp,
+                                1
+                            );
+                        }
+                        return $patched ?? $sp;
+                    },
+                    $xml
+                );
+                if (!is_string($new_xml) || $new_xml === $xml) {
+                    continue;
+                }
+                $zip->deleteName($name);
+                $zip->addFromString($name, $new_xml);
+            }
+        } finally {
+            $zip->close();
         }
     }
 
