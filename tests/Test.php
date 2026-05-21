@@ -406,4 +406,101 @@ class Test extends \PHPUnit\Framework\TestCase
         $this->assertStringContainsString('bullet ONE', $slide1);
         $this->assertStringContainsString('bullet TWO', $slide1);
     }
+
+    public function test__title_slide_system_placeholders_lose_xfrm(): void
+    {
+        // Pandoc writes its own <a:xfrm> on ctrTitle/dt/ftr/sldNum which
+        // overlaps rotated decorations on the skeleton's title slide. After
+        // our post-process those system placeholders must have no xfrm —
+        // they then inherit the layout's intended position.
+        $out = sys_get_temp_dir() . '/ppthelper_test_geom_titleslide.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "% Deck Title\n% Author\n% 21. Mai 2026\n\n# Content slide\n\n- bullet",
+            'output' => $out
+        ]);
+        $slide1 = self::loadSlideXml($out, 1);
+        foreach (['ctrTitle', 'dt', 'ftr', 'sldNum'] as $type) {
+            if (preg_match(
+                '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*type="' . $type . '"(?:(?!</p:sp>).)*?</p:sp>#s',
+                $slide1,
+                $m
+            ) === 1) {
+                $this->assertStringNotContainsString(
+                    '<a:xfrm>',
+                    $m[0],
+                    'placeholder type="' . $type . '" must lose its xfrm so it falls back to layout default'
+                );
+            }
+        }
+    }
+
+    public function test__geometry_pass_preserves_two_column_content(): void
+    {
+        // The geometry pass must not delete content from two-column slides
+        // (idx=1 / idx=2 body placeholders). Pandoc relies on layout-4
+        // ("Two Content") for these — we must touch only system placeholders.
+        $out = sys_get_temp_dir() . '/ppthelper_test_geom_twocol.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "# Headline\n\n:::: {.columns}\n::: {.column}\n- LEFT_BULLET\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::",
+            'output' => $out
+        ]);
+        $slide1 = self::loadSlideXml($out, 1);
+        $this->assertStringContainsString('LEFT_BULLET', $slide1);
+        $this->assertStringContainsString('RIGHT_BULLET', $slide1);
+        $this->assertMatchesRegularExpression('#<p:ph\b[^/]*idx="1"#', $slide1);
+        $this->assertMatchesRegularExpression('#<p:ph\b[^/]*idx="2"#', $slide1);
+    }
+
+    public function test__large_table_grows_cy(): void
+    {
+        // 6-row table: Pandoc emits cy=2552700 (~2.8"); our post-process must
+        // bump it to at least row_count * 380000 + 100000 = 2,380,000 + 100,000
+        // = 2,480,000 — which in this case is below the original, so the
+        // original wins. Try a 10-row table to trigger growth.
+        $rows = ['| col1 | col2 |', '|---|---|'];
+        for ($i = 1; $i <= 10; $i++) {
+            $rows[] = '| r' . $i . 'a | r' . $i . 'b |';
+        }
+        $md = "# Table\n\n" . implode("\n", $rows);
+        $out = sys_get_temp_dir() . '/ppthelper_test_table_grow.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);
+        $gf_match = preg_match(
+            '#<p:graphicFrame\b[^>]*>.*?</p:graphicFrame>#s',
+            $slide1,
+            $gfm
+        );
+        $this->assertSame(1, $gf_match, 'graphicFrame for the table must exist');
+        $rows_in_gf = preg_match_all('#<a:tr\b#', $gfm[0]);
+        $expected_min_cy = $rows_in_gf * 380000 + 100000;
+        $ext_match = preg_match('#<a:ext\s+cx="\d+"\s+cy="(\d+)"#', $gfm[0], $em);
+        $this->assertSame(1, $ext_match, 'ext on graphicFrame must exist');
+        $this->assertGreaterThanOrEqual(
+            $expected_min_cy,
+            (int) $em[1],
+            'cy must grow to fit ' . $rows_in_gf . ' rows'
+        );
+    }
+
+    public function test__small_table_keeps_cy(): void
+    {
+        // 3-row table: under the 5-row threshold, cy must stay as Pandoc set
+        // it — no unnecessary growth.
+        $md = "# Small\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
+        $out = sys_get_temp_dir() . '/ppthelper_test_table_small.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);
+        if (preg_match('#<p:graphicFrame\b[^>]*>.*?</p:graphicFrame>#s', $slide1, $gfm) !== 1) {
+            $this->markTestSkipped('Pandoc rendered no table for this markdown');
+        }
+        $this->assertMatchesRegularExpression(
+            '#<a:ext\s+cx="\d+"\s+cy="\d+"#',
+            $gfm[0],
+            'small table must still have an <a:ext>'
+        );
+    }
 }

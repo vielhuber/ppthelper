@@ -137,6 +137,15 @@ class ppthelper
         // so it always stays inside the placeholder.
         self::enableAutoFitOnBodyPlaceholders($output);
 
+        // Pandoc writes a fixed <a:xfrm> on every placeholder, including the
+        // system ones (centered title, date, footer, slide number), with a
+        // one-size-fits-all box that often collides with rotated date fields
+        // or other master decorations. Stripping the xfrm makes the placeholder
+        // fall back to the layout's intended position. Tables get a minimum
+        // cy proportional to the row count so auto-sized rows don't overflow
+        // the fixed Pandoc box.
+        self::fixSlideShapeGeometry($output);
+
         self::validateOutput($output);
 
         // Post-process: transitions + animations.
@@ -409,6 +418,89 @@ class ppthelper
                         return $patched ?? $sp;
                     },
                     $xml
+                );
+                if (!is_string($new_xml) || $new_xml === $xml) {
+                    continue;
+                }
+                $zip->deleteName($name);
+                $zip->addFromString($name, $new_xml);
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Two post-process fixes for the per-slide XML:
+     *
+     *  1. Strip the <a:xfrm> Pandoc writes onto ctrTitle / dt / ftr / sldNum
+     *     placeholders. Pandoc uses one geometry for all title slides, which
+     *     in our skeleton overlaps the rotated date field on the right edge.
+     *     Removing the xfrm makes the placeholder inherit the layout default.
+     *
+     *  2. Grow the <a:ext cy> of <p:graphicFrame> table shapes when the row
+     *     count exceeds Pandoc's fixed box. Pandoc emits e.g. cy=2552700 for
+     *     a 6-row table, which is fine for tight content but clips when row
+     *     text wraps. We bump cy to ~0.42" per row so auto-sized rows fit.
+     */
+    private static function fixSlideShapeGeometry(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for shape-geometry pass: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $new_xml = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m): string {
+                        $sp = $m[0];
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:ctrTitle|dt|ftr|sldNum)"#', $sp) !== 1) {
+                            return $sp;
+                        }
+                        $stripped = preg_replace('#<a:xfrm>.*?</a:xfrm>#s', '', $sp, 1);
+                        return is_string($stripped) ? $stripped : $sp;
+                    },
+                    $xml
+                );
+                if (is_string($new_xml)) {
+                    $xml_stage1 = $new_xml;
+                } else {
+                    $xml_stage1 = $xml;
+                }
+                $new_xml = preg_replace_callback(
+                    '#<p:graphicFrame\b[^>]*>.*?</p:graphicFrame>#s',
+                    static function (array $m): string {
+                        $gf = $m[0];
+                        if (!str_contains($gf, '<a:tbl>')) {
+                            return $gf;
+                        }
+                        $row_count = preg_match_all('#<a:tr\b#', $gf);
+                        if ($row_count < 5) {
+                            return $gf;
+                        }
+                        $needed_cy = $row_count * 380000 + 100000;
+                        $patched = preg_replace_callback(
+                            '#<a:ext\s+cx="(\d+)"\s+cy="(\d+)"\s*/>#',
+                            static function (array $em) use ($needed_cy): string {
+                                $cx = (int) $em[1];
+                                $cy = max((int) $em[2], $needed_cy);
+                                return '<a:ext cx="' . $cx . '" cy="' . $cy . '"/>';
+                            },
+                            $gf,
+                            1
+                        );
+                        return is_string($patched) ? $patched : $gf;
+                    },
+                    $xml_stage1
                 );
                 if (!is_string($new_xml) || $new_xml === $xml) {
                     continue;
