@@ -126,6 +126,11 @@ class ppthelper
             @unlink($md_source);
         }
 
+        // Pandoc rewrites slideMaster*.xml + slideLayout*.xml with hardcoded
+        // placeholder positions, destroying the carefully-crafted geometry of
+        // the user's master design. Copy them back verbatim from the template.
+        self::restoreSkeletonLayouts($output, $template);
+
         self::validateOutput($output);
 
         // Post-process: transitions + animations.
@@ -299,6 +304,52 @@ class ppthelper
             throw new RuntimeException(
                 'ppthelper::render: pandoc failed (exit ' . $exit . '): ' . trim($stderr !== '' ? $stderr : $stdout)
             );
+        }
+    }
+
+    /**
+     * Copy every `ppt/slideMasters/slideMaster*.xml` and
+     * `ppt/slideLayouts/slideLayout*.xml` from the skeleton back into the
+     * pandoc-generated output, overwriting Pandoc's rewrites. Pandoc replaces
+     * placeholder geometry (positions, sizes) with hardcoded defaults that
+     * destroy the user's master design. Theme XML stays untouched in the
+     * output (mutateTheme already wrote it via the themed reference Pandoc
+     * consumed), and slide content stays untouched (that's the model's input).
+     */
+    private static function restoreSkeletonLayouts(string $output_path, string $template_path): void
+    {
+        $template_zip = new ZipArchive();
+        if ($template_zip->open($template_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open template for layout restore: ' . $template_path);
+        }
+        $output_zip = new ZipArchive();
+        if ($output_zip->open($output_path) !== true) {
+            $template_zip->close();
+            throw new RuntimeException('ppthelper::render: failed to open output for layout restore: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $template_zip->numFiles; $i++) {
+                $name = $template_zip->getNameIndex($i);
+                if (!is_string($name)) {
+                    continue;
+                }
+                $is_master = preg_match('#^ppt/slideMasters/slideMaster\d+\.xml$#', $name) === 1;
+                $is_layout = preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $name) === 1;
+                if (!$is_master && !$is_layout) {
+                    continue;
+                }
+                $contents = $template_zip->getFromIndex($i);
+                if (!is_string($contents)) {
+                    continue;
+                }
+                if ($output_zip->locateName($name) !== false) {
+                    $output_zip->deleteName($name);
+                }
+                $output_zip->addFromString($name, $contents);
+            }
+        } finally {
+            $template_zip->close();
+            $output_zip->close();
         }
     }
 

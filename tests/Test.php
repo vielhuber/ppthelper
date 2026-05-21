@@ -283,4 +283,80 @@ class Test extends \PHPUnit\Framework\TestCase
 
         $this->assertSame($skeleton_theme, self::loadThemeXml($out));
     }
+
+    public function test__skeleton_layouts_and_masters_restored_after_pandoc(): void
+    {
+        // Pandoc rewrites slideLayout*.xml and slideMaster*.xml with hardcoded
+        // placeholder positions; restoreSkeletonLayouts must put them back so
+        // the user's master geometry survives the render. We verify by byte-
+        // comparing every layout/master between the skeleton and the output.
+        $out = sys_get_temp_dir() . '/ppthelper_test_layouts_restored.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "# Alpha\n\n- one\n- two\n\n# Beta\n\n:::: {.columns}\n::: {.column}\nleft text\n:::\n::: {.column}\nright text\n:::\n::::",
+            'output' => $out
+        ]);
+
+        $skeleton_zip = new ZipArchive();
+        $skeleton_zip->open(dirname(__DIR__) . '/assets/skeleton.pptx');
+        $output_zip = new ZipArchive();
+        $output_zip->open($out);
+
+        $checked = 0;
+        try {
+            for ($i = 0; $i < $skeleton_zip->numFiles; $i++) {
+                $name = $skeleton_zip->getNameIndex($i);
+                if (
+                    preg_match('#^ppt/slide(Layouts/slideLayout|Masters/slideMaster)\d+\.xml$#', (string) $name) !== 1
+                ) {
+                    continue;
+                }
+                $skel = $skeleton_zip->getFromName($name);
+                $out_content = $output_zip->getFromName($name);
+                $this->assertNotFalse($out_content, "expected $name to exist in render output");
+                $this->assertSame($skel, $out_content, "$name should be byte-identical to skeleton after restore");
+                $checked++;
+            }
+        } finally {
+            $skeleton_zip->close();
+            $output_zip->close();
+        }
+        $this->assertGreaterThan(0, $checked, 'no layouts/masters in skeleton to check — fixture broken?');
+    }
+
+    public function test__layout_restore_does_not_clobber_theme_overrides(): void
+    {
+        // Layout-restore must NOT touch ppt/theme/theme1.xml — that's the
+        // place where mutateTheme writes color/font overrides. Combine an
+        // explicit color override with a normal render and verify the
+        // override survives.
+        $out = sys_get_temp_dir() . '/ppthelper_test_layouts_keep_theme.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "# Themed slide\n\n- bullet",
+            'output' => $out,
+            'colors_primary' => '#AA22BB'
+        ]);
+        $theme = self::loadThemeXml($out);
+        $this->assertMatchesRegularExpression('#<a:accent1>\s*<a:srgbClr val="AA22BB"/>#', $theme);
+    }
+
+    public function test__layout_restore_does_not_clobber_slide_content(): void
+    {
+        // Slides must keep the model's content after restore. Plain bullets,
+        // a heading, a table — all must appear in the output text body.
+        $out = sys_get_temp_dir() . '/ppthelper_test_layouts_keep_slides.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "# Headline X\n\n- bullet ONE\n- bullet TWO\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+            'output' => $out
+        ]);
+        $zip = new ZipArchive();
+        $zip->open($out);
+        $slide1 = $zip->getFromName('ppt/slides/slide1.xml');
+        $zip->close();
+        $this->assertStringContainsString('Headline X', $slide1);
+        $this->assertStringContainsString('bullet ONE', $slide1);
+        $this->assertStringContainsString('bullet TWO', $slide1);
+    }
 }
