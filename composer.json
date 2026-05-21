@@ -1,0 +1,18 @@
+{
+    "name": "vielhuber/ppthelper",
+    "description": "MCP server that turns Markdown into editable PowerPoint decks via Pandoc with a dynamically themed reference.pptx.",
+    "license": "MIT",
+    "require": {
+        "php": "^8.3",
+        "ext-zip": "*",
+        "vielhuber/simplemcp": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "vielhuber\\ppthelper\\": "src/"
+        }
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10 || ^11"
+    }
+}

@@ -1,0 +1,653 @@
+<?php
+declare(strict_types=1);
+
+namespace vielhuber\ppthelper;
+
+use RuntimeException;
+use ZipArchive;
+use vielhuber\simplemcp\Attributes\McpTool;
+
+/**
+ * ppthelper — turn Pandoc-flavored Markdown into editable PowerPoint decks.
+ *
+ * Companion to excelhelper / aihelper: pure static API, options-array style.
+ *
+ *   ppthelper::render([
+ *       'input_markdown' => '# Slide 1 …',
+ *       'output' => '/path/to/deck.pptx',
+ *       'colors_primary' => '#1F4E79',
+ *       'fonts_heading' => 'Aptos Display',
+ *       'transitions' => 'fade',
+ *       'animations' => true
+ *   ]);
+ *
+ * Each call (a) builds a themed copy of the bundled `assets/skeleton.pptx`
+ * (mutating ppt/theme/theme1.xml), (b) runs pandoc with that as
+ * `--reference-doc`, then (c) optionally post-processes the resulting .pptx
+ * to inject slide transitions and per-bullet click-to-advance animations.
+ * Slide layouts reference theme entries by name (`accent1`, `dk2`,
+ * `majorFont`, `minorFont`), so theme changes propagate to every slide.
+ *
+ * The same class also exposes the `render_deck` simplemcp tool for AI-agent
+ * workflows (charly etc.) via the `#[McpTool]`-annotated method below.
+ */
+class ppthelper
+{
+    // ====================================================================
+    //  Public static API — direct PHP usage
+    // ====================================================================
+
+    /**
+     * Render a Markdown deck into an editable .pptx and return its path.
+     *
+     * Accepted options (all flat keys):
+     *   - `input_markdown` (string) — inline Pandoc-Markdown content. Mutually
+     *     exclusive with `input_file`; exactly one of the two is required.
+     *   - `input_file` (string) — path to a markdown file to read instead of
+     *     passing content inline.
+     *   - `input_template` (string, optional) — path to a custom reference.pptx
+     *     skeleton. Defaults to the bundled `assets/skeleton.pptx`.
+     *   - `output` (string, optional) — output .pptx path. If omitted a
+     *     tempfile is created and its path returned.
+     *   - `colors_primary` (hex, e.g. "#1F4E79") → `<a:accent1>` and `<a:dk2>`
+     *   - `colors_secondary` (hex) → `<a:accent2>`
+     *   - `colors_background` (hex) → `<a:lt1>`; default white
+     *   - `colors_text` (hex) → `<a:dk1>`; default near-black
+     *   - `fonts_heading` (string) → `<a:majorFont><a:latin typeface="">`
+     *   - `fonts_text` (string) → `<a:minorFont><a:latin typeface="">`
+     *   - `transitions` (false|'fade'|'slide', default false) — slide transition
+     *     applied to every slide via post-render XML injection.
+     *   - `animations` (bool, default false) — when true, every body bullet
+     *     appears on a separate click (PowerPoint "Appear → By Paragraph").
+     *   - `pandoc_path` (string, optional) — pandoc executable. Default
+     *     "pandoc" (relies on $PATH).
+     *
+     * Relative image paths in the markdown (`![](logo.png)`) resolve against
+     * the caller's current working directory at the moment `render()` is
+     * invoked. Absolute paths always work, regardless of cwd.
+     *
+     * @return string Absolute path to the written .pptx file.
+     */
+    public static function render(array $args): string
+    {
+        // Snapshot the caller's cwd up front — pandoc will be spawned with
+        // this as its working directory so relative image references in the
+        // markdown resolve where the caller expects them to.
+        $caller_cwd = getcwd();
+        if ($caller_cwd === false) {
+            throw new RuntimeException('ppthelper::render: getcwd() failed.');
+        }
+
+        $markdown = self::resolveMarkdown($args);
+
+        $output = $args['output'] ?? null;
+        if ($output === null || $output === '') {
+            $output = tempnam(sys_get_temp_dir(), 'ppthelper_') . '.pptx';
+        } elseif (!is_string($output)) {
+            throw new RuntimeException('ppthelper::render: option "output" must be a string path.');
+        }
+        // Resolve relative output against the caller's cwd so the eventual
+        // path-on-disk matches what was passed in, not pandoc's cwd.
+        if (!str_starts_with($output, '/')) {
+            $output = $caller_cwd . '/' . $output;
+        }
+
+        $template = $args['input_template'] ?? (dirname(__DIR__) . '/assets/skeleton.pptx');
+        if (!is_string($template) || !is_file($template)) {
+            throw new RuntimeException('ppthelper::render: input_template skeleton not found at ' . (string) $template);
+        }
+
+        $pandoc_path = (string) ($args['pandoc_path'] ?? 'pandoc');
+
+        $out_dir = dirname($output);
+        if (!is_dir($out_dir) && !@mkdir($out_dir, 0775, true) && !is_dir($out_dir)) {
+            throw new RuntimeException('ppthelper::render: failed to create output directory ' . $out_dir);
+        }
+
+        // Tempfiles: themed reference + markdown source. Both unlinked on exit
+        // even when pandoc throws.
+        $themed_ref = tempnam(sys_get_temp_dir(), 'pptx_ref_') . '.pptx';
+        $md_source = tempnam(sys_get_temp_dir(), 'pptx_md_') . '.md';
+        try {
+            self::mutateTheme($template, $themed_ref, [
+                'colors_primary' => $args['colors_primary'] ?? null,
+                'colors_secondary' => $args['colors_secondary'] ?? null,
+                'colors_background' => $args['colors_background'] ?? null,
+                'colors_text' => $args['colors_text'] ?? null,
+                'fonts_heading' => $args['fonts_heading'] ?? null,
+                'fonts_text' => $args['fonts_text'] ?? null
+            ]);
+            if (@file_put_contents($md_source, $markdown) === false) {
+                throw new RuntimeException('ppthelper::render: failed to write markdown to ' . $md_source);
+            }
+            self::runPandoc($pandoc_path, $md_source, $themed_ref, $output, $caller_cwd);
+        } finally {
+            @unlink($themed_ref);
+            @unlink($md_source);
+        }
+
+        self::validateOutput($output);
+
+        // Post-process: transitions + animations.
+        $transitions = $args['transitions'] ?? false;
+        $animations = (bool) ($args['animations'] ?? false);
+        if ($transitions !== false || $animations) {
+            self::postProcessPptx($output, $transitions !== false ? (string) $transitions : null, $animations);
+        }
+        return $output;
+    }
+
+    // ====================================================================
+    //  MCP tool wrapper — drives the `render_deck` simplemcp tool
+    // ====================================================================
+
+    /**
+     * Render a Markdown deck into an editable PowerPoint file.
+     *
+     * The markdown follows Pandoc's slideshow conventions:
+     *   - First three lines `% Title`, `% Author`, `% Date` become the title slide.
+     *   - Each `# Heading` starts a new slide; the body is its content.
+     *   - Two-column layouts via `::: {.columns}` / `::: {.column}` fences.
+     *   - Tables, fenced code, bullets, ordered lists, images, math: all
+     *     standard Pandoc-Markdown.
+     *   - Inline images: `![alt](/host/data/files/[CHAT_ID]/<name>.png)`.
+     *
+     * @param string $markdown The complete deck as one Pandoc-Markdown blob.
+     * @param string|null $primary_color Hex color (e.g. "#1F4E79") for headings and primary accents. Default keeps the skeleton's #1F4E79.
+     * @param string|null $accent_color Hex color (e.g. "#F59E0B") for secondary accents (charts, links). Default keeps the skeleton's #F59E0B.
+     * @param string|null $background_color Hex color (e.g. "#FFFFFF") for the slide background. Default white.
+     * @param string|null $text_color Hex color (e.g. "#111827") for body text. Default near-black.
+     * @param string|null $heading_font Font family for headings, e.g. "Aptos Display", "Inter", "Calibri". ASCII letters/digits/space/dash only, max 64 chars.
+     * @param string|null $body_font Font family for body text, e.g. "Aptos", "Inter", "Calibri".
+     * @param string|null $transitions Slide transition applied to every slide. One of: null (none), "fade", "slide".
+     * @param bool|null $animations When true, body bullets appear one click at a time (PowerPoint "Appear → By Paragraph").
+     * @param string|null $filename Output filename only (e.g. "deck.pptx"), no directory path. Defaults to an auto-name.
+     * @param string $chat_id Current chat UUID — injected by the URL routing layer.
+     * @param string|null $chat_message_id Injected by the URL routing layer (unused).
+     * @return array{path: string} Path to the generated .pptx file.
+     */
+    #[McpTool(name: 'render_deck')]
+    public function renderDeck(
+        string $markdown,
+        ?string $primary_color = null,
+        ?string $accent_color = null,
+        ?string $background_color = null,
+        ?string $text_color = null,
+        ?string $heading_font = null,
+        ?string $body_font = null,
+        ?string $transitions = null,
+        ?bool $animations = null,
+        ?string $filename = null,
+        ?string $chat_id = null,
+        ?string $chat_message_id = null
+    ): array {
+        if (($chat_id ?? '') === '') {
+            throw new RuntimeException(
+                'Parameter "chat_id" was not injected by the URL routing layer. The MCP url must include [CHAT_ID].'
+            );
+        }
+        $output = '/host/data/files/' . $chat_id . '/' . self::resolveMcpFilename($filename);
+        $path = self::render([
+            'input_markdown' => $markdown,
+            'output' => $output,
+            'colors_primary' => $primary_color,
+            'colors_secondary' => $accent_color,
+            'colors_background' => $background_color,
+            'colors_text' => $text_color,
+            'fonts_heading' => $heading_font,
+            'fonts_text' => $body_font,
+            'transitions' => $transitions !== null && $transitions !== '' ? $transitions : false,
+            'animations' => (bool) ($animations ?? false)
+        ]);
+        return ['path' => $path];
+    }
+
+    // ====================================================================
+    //  Private helpers — input resolution + output validation
+    // ====================================================================
+
+    /**
+     * Read the markdown content from either an inline string (`input_markdown`)
+     * or a file path (`input_file`). Mutually exclusive: passing both, or
+     * neither, raises.
+     */
+    private static function resolveMarkdown(array $args): string
+    {
+        $has_inline = isset($args['input_markdown']) && $args['input_markdown'] !== '';
+        $has_file = isset($args['input_file']) && $args['input_file'] !== '';
+        if ($has_inline && $has_file) {
+            throw new RuntimeException('ppthelper::render: pass either "input_markdown" or "input_file", not both.');
+        }
+        if (!$has_inline && !$has_file) {
+            throw new RuntimeException('ppthelper::render: one of "input_markdown" (inline) or "input_file" (path) is required.');
+        }
+        if ($has_inline) {
+            if (!is_string($args['input_markdown'])) {
+                throw new RuntimeException('ppthelper::render: option "input_markdown" must be a string.');
+            }
+            return $args['input_markdown'];
+        }
+        $file = $args['input_file'];
+        if (!is_string($file) || !is_file($file)) {
+            throw new RuntimeException('ppthelper::render: input_file not found at ' . (string) $file);
+        }
+        $content = @file_get_contents($file);
+        if ($content === false) {
+            throw new RuntimeException('ppthelper::render: failed to read input_file ' . $file);
+        }
+        return $content;
+    }
+
+    /**
+     * Verify the rendered file is a usable PPTX: openable as zip, contains at
+     * least one slide and the theme XML. Catches half-written or corrupted
+     * output that a simple filesize check would miss.
+     */
+    private static function validateOutput(string $path): void
+    {
+        if (!is_file($path)) {
+            throw new RuntimeException('ppthelper::render: output file missing after pandoc: ' . $path);
+        }
+        $zip = new ZipArchive();
+        if ($zip->open($path, ZipArchive::CHECKCONS) !== true) {
+            throw new RuntimeException('ppthelper::render: output is not a readable .pptx archive: ' . $path);
+        }
+        try {
+            $slide_count = 0;
+            $has_theme = false;
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (preg_match('#^ppt/slides/slide\d+\.xml$#', (string) $name) === 1) {
+                    $slide_count++;
+                } elseif ($name === 'ppt/theme/theme1.xml') {
+                    $has_theme = true;
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+        if ($slide_count === 0) {
+            throw new RuntimeException('ppthelper::render: output contains zero slides — pandoc likely received an empty or invalid markdown body.');
+        }
+        if (!$has_theme) {
+            throw new RuntimeException('ppthelper::render: output is missing ppt/theme/theme1.xml — file is not a valid PowerPoint deck.');
+        }
+    }
+
+    private static function runPandoc(string $pandoc_path, string $md_source, string $themed_ref, string $out_path, string $cwd): void
+    {
+        // Spawn pandoc with `--resource-path=<caller's cwd>` AND set its
+        // working directory to the same place. Pandoc resolves relative
+        // image refs in the markdown against the resource-path; setting cwd
+        // additionally makes any other relative refs (e.g. include-files)
+        // behave the same way. Absolute paths in the markdown work
+        // regardless.
+        $cmd = [$pandoc_path, '--reference-doc=' . $themed_ref, '--resource-path=' . $cwd, '-o', $out_path, $md_source];
+
+        // proc_open with an argv array bypasses the shell — no escaping needed.
+        $proc = proc_open(
+            $cmd,
+            [
+                0 => ['pipe', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['pipe', 'w']
+            ],
+            $pipes,
+            $cwd,
+            null
+        );
+        if (!is_resource($proc)) {
+            throw new RuntimeException('ppthelper::render: failed to spawn pandoc.');
+        }
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]) ?: '';
+        $stderr = stream_get_contents($pipes[2]) ?: '';
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($proc);
+        if ($exit !== 0) {
+            throw new RuntimeException(
+                'ppthelper::render: pandoc failed (exit ' . $exit . '): ' . trim($stderr !== '' ? $stderr : $stdout)
+            );
+        }
+    }
+
+    private static function resolveMcpFilename(?string $filename): string
+    {
+        if ($filename === null || $filename === '') {
+            return 'deck_' . date('Ymd_His') . '.pptx';
+        }
+        // strip any directory traversal; only the basename is allowed
+        $basename = basename($filename);
+        if ($basename === '' || $basename !== $filename) {
+            throw new RuntimeException('Parameter "filename" must be a bare filename without path components.');
+        }
+        if (!str_ends_with(strtolower($basename), '.pptx')) {
+            $basename .= '.pptx';
+        }
+        return $basename;
+    }
+
+    // ====================================================================
+    //  Private helpers — theme mutation (ppt/theme/theme1.xml)
+    // ====================================================================
+
+    /**
+     * Write a themed copy of $skeleton to $destination. All theme keys are
+     * optional — null/missing means "keep the skeleton default". Slide layouts
+     * in the skeleton reference theme entries by name (accent1, dk2,
+     * majorFont, …), so a single theme swap propagates to every slide.
+     *
+     * @param array{
+     *     colors_primary?: ?string,
+     *     colors_secondary?: ?string,
+     *     colors_background?: ?string,
+     *     colors_text?: ?string,
+     *     fonts_heading?: ?string,
+     *     fonts_text?: ?string
+     * } $theme
+     */
+    private static function mutateTheme(string $skeleton, string $destination, array $theme): void
+    {
+        if (!is_file($skeleton)) {
+            throw new RuntimeException('Skeleton reference.pptx not found at ' . $skeleton);
+        }
+        if (!@copy($skeleton, $destination)) {
+            throw new RuntimeException('Failed to copy skeleton to ' . $destination);
+        }
+        $zip = new ZipArchive();
+        if ($zip->open($destination) !== true) {
+            throw new RuntimeException('Failed to open themed reference for mutation: ' . $destination);
+        }
+        try {
+            $xml = $zip->getFromName('ppt/theme/theme1.xml');
+            if ($xml === false) {
+                throw new RuntimeException('ppt/theme/theme1.xml missing from skeleton');
+            }
+            // dk1/lt1 are sysClr (window/text) in the skeleton — we promote
+            // them to srgbClr so PowerPoint honours the override consistently
+            // across Office versions; otherwise leaving them as sysClr means
+            // the user's system colors leak in unpredictably.
+            $color_map = [
+                // theme role => desired hex (null = keep current)
+                'dk1' => self::normalizeHex($theme['colors_text'] ?? null),
+                'lt1' => self::normalizeHex($theme['colors_background'] ?? null),
+                'dk2' => self::normalizeHex($theme['colors_primary'] ?? null),
+                'accent1' => self::normalizeHex($theme['colors_primary'] ?? null),
+                'accent2' => self::normalizeHex($theme['colors_secondary'] ?? null)
+            ];
+            foreach ($color_map as $role => $hex) {
+                if ($hex === null) {
+                    continue;
+                }
+                // match both srgbClr-form and sysClr-form
+                $pattern = '#<a:' . $role . '>\s*<a:(?:srgbClr|sysClr)[^/]*/>\s*</a:' . $role . '>#';
+                $replacement = '<a:' . $role . '><a:srgbClr val="' . $hex . '"/></a:' . $role . '>';
+                $xml = preg_replace($pattern, $replacement, $xml, 1);
+            }
+            $heading = self::sanitizeFontName($theme['fonts_heading'] ?? null);
+            $body = self::sanitizeFontName($theme['fonts_text'] ?? null);
+            if ($heading !== null) {
+                $xml = preg_replace(
+                    '#(<a:majorFont>.*?<a:latin typeface=")[^"]+(")#s',
+                    '${1}' . $heading . '${2}',
+                    $xml,
+                    1
+                );
+            }
+            if ($body !== null) {
+                $xml = preg_replace(
+                    '#(<a:minorFont>.*?<a:latin typeface=")[^"]+(")#s',
+                    '${1}' . $body . '${2}',
+                    $xml,
+                    1
+                );
+            }
+            $zip->deleteName('ppt/theme/theme1.xml');
+            $zip->addFromString('ppt/theme/theme1.xml', $xml);
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Accept "#1F4E79" (preferred), also tolerates "1F4E79" / "1f4e79" without
+     * the #-prefix. Reject anything that isn't a 6-hex triplet — preg_replace
+     * pasting an attacker-controlled string into the XML would otherwise break
+     * the file or worse.
+     */
+    private static function normalizeHex(?string $value): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+        $stripped = ltrim($value, '#');
+        if (preg_match('/^[0-9A-Fa-f]{6}$/', $stripped) !== 1) {
+            throw new RuntimeException('Invalid color "' . $value . '"; expected 6-digit hex like "#1F4E79".');
+        }
+        return strtoupper($stripped);
+    }
+
+    private static function sanitizeFontName(?string $value): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+        // Same allow-list PowerPoint itself uses for typeface attributes: ASCII
+        // letters/digits/space/dash. Quote/angle-bracket would break the XML.
+        if (preg_match('/^[A-Za-z0-9 \-]{1,64}$/', $value) !== 1) {
+            throw new RuntimeException('Invalid font name "' . $value . '"; ASCII letters/digits/space/dash only, max 64 chars.');
+        }
+        return $value;
+    }
+
+    // ====================================================================
+    //  Private helpers — post-render OOXML mutations (transitions + anims)
+    // ====================================================================
+
+    /**
+     * Apply optional transitions and per-bullet click animations to a
+     * finished .pptx. Both features are missing from pandoc's PPTX writer
+     * but get injected here by manipulating the slide XML directly.
+     * Idempotent: slides that already have a transition or timing block are
+     * left untouched.
+     */
+    private static function postProcessPptx(string $pptx_path, ?string $transition, bool $animations): void
+    {
+        if ($transition === null && !$animations) {
+            return;
+        }
+        if ($transition !== null && !in_array($transition, ['fade', 'slide'], true)) {
+            throw new RuntimeException('ppthelper::render: transitions must be false, "fade" or "slide"; got "' . $transition . '".');
+        }
+        $zip = new ZipArchive();
+        if ($zip->open($pptx_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open ' . $pptx_path . ' for post-processing.');
+        }
+        try {
+            $slide_names = [];
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (is_string($name) && preg_match('#^ppt/slides/slide\d+\.xml$#', $name) === 1) {
+                    $slide_names[] = $name;
+                }
+            }
+            foreach ($slide_names as $name) {
+                $xml = $zip->getFromName($name);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $modified = false;
+                if ($transition !== null) {
+                    $new_xml = self::injectTransition($xml, $transition);
+                    if ($new_xml !== $xml) {
+                        $xml = $new_xml;
+                        $modified = true;
+                    }
+                }
+                if ($animations) {
+                    $new_xml = self::injectClickAnimations($xml);
+                    if ($new_xml !== $xml) {
+                        $xml = $new_xml;
+                        $modified = true;
+                    }
+                }
+                if ($modified) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $xml);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Insert a `<p:transition>` element right before `</p:sld>`. Skips slides
+     * that already have a transition.
+     */
+    private static function injectTransition(string $xml, string $transition): string
+    {
+        if (str_contains($xml, '<p:transition')) {
+            return $xml;
+        }
+        // OOXML preset transitions; both fade and push are smooth and widely
+        // supported across PowerPoint versions and Keynote.
+        $snippet = match ($transition) {
+            'fade' => '<p:transition><p:fade/></p:transition>',
+            'slide' => '<p:transition><p:push dir="r"/></p:transition>',
+            default => null
+        };
+        if ($snippet === null) {
+            return $xml;
+        }
+        return str_replace('</p:sld>', $snippet . '</p:sld>', $xml);
+    }
+
+    /**
+     * Build and inject a `<p:timing>` block that animates every body paragraph
+     * of the slide as a separate click step ("Appear → By Paragraph" in the
+     * PowerPoint UI). No-op when the slide has no body placeholder or only an
+     * empty body, and idempotent.
+     */
+    private static function injectClickAnimations(string $xml): string
+    {
+        if (str_contains($xml, '<p:timing')) {
+            return $xml;
+        }
+        $target = self::findBodyTarget($xml);
+        if ($target === null) {
+            return $xml;
+        }
+        ['shape_id' => $shape_id, 'paragraph_count' => $paragraph_count] = $target;
+        if ($paragraph_count < 1) {
+            return $xml;
+        }
+        $timing = self::buildClickTimingBlock($shape_id, $paragraph_count);
+        return str_replace('</p:sld>', $timing . '</p:sld>', $xml);
+    }
+
+    /**
+     * Locate the body content placeholder of a pandoc-generated slide and
+     * count its text-carrying paragraphs. Pandoc emits one `<p:sp>` per
+     * layout placeholder; the body is the one whose `<p:ph>` carries
+     * `type="body"`/`"obj"` or no type with `idx="1"`. Explicitly excludes
+     * title-slide placeholders so the subtitle doesn't get animated by
+     * accident.
+     *
+     * @return array{shape_id: int, paragraph_count: int}|null
+     */
+    private static function findBodyTarget(string $xml): ?array
+    {
+        if (preg_match_all('#<p:sp\b[^>]*>(.*?)</p:sp>#s', $xml, $matches) !== 1 && empty($matches[0])) {
+            return null;
+        }
+        foreach ($matches[0] as $sp) {
+            if (preg_match('#<p:ph\b([^/]*)/?>#', $sp, $ph_m) !== 1) {
+                continue;
+            }
+            $ph_attrs = $ph_m[1];
+            $type = preg_match('#\btype="([^"]+)"#', $ph_attrs, $tm) === 1 ? $tm[1] : '';
+            if (in_array($type, ['ctrTitle', 'subTitle', 'title'], true)) {
+                continue;
+            }
+            $has_idx_1 = preg_match('#\bidx="1"#', $ph_attrs) === 1;
+            $is_body = in_array($type, ['body', 'obj'], true) || ($type === '' && $has_idx_1);
+            if (!$is_body) {
+                continue;
+            }
+            if (preg_match('#<p:cNvPr\s+id="(\d+)"#', $sp, $id_m) !== 1) {
+                continue;
+            }
+            $shape_id = (int) $id_m[1];
+            if (preg_match('#<p:txBody>(.*?)</p:txBody>#s', $sp, $body_m) !== 1) {
+                continue;
+            }
+            // Only count paragraphs that actually carry a text run — empty
+            // <a:p/> placeholders would still get an animation step and waste
+            // clicks during presentation.
+            $body = $body_m[1];
+            $count = preg_match_all('#<a:p\b[^>]*>(?:(?!</a:p>).)*?<a:r\b#s', $body);
+            if ($count < 1) {
+                continue;
+            }
+            return ['shape_id' => $shape_id, 'paragraph_count' => $count];
+        }
+        return null;
+    }
+
+    /**
+     * Build the verbose `<p:timing>` XML for an "Appear, by paragraph,
+     * on click" effect on $paragraph_count paragraphs of the shape with id
+     * $shape_id. Each paragraph gets its own click trigger.
+     *
+     * IDs are unique per timing block (sequential from 1). The presetID=1 +
+     * presetClass=entr combo is OOXML's "Appear" entrance effect.
+     */
+    private static function buildClickTimingBlock(int $shape_id, int $paragraph_count): string
+    {
+        $next_id = 1;
+        $click_steps = '';
+        for ($p = 0; $p < $paragraph_count; $p++) {
+            $cTn_outer = $next_id++;
+            $cTn_inner = $next_id++;
+            $cTn_effect = $next_id++;
+            $cTn_set = $next_id++;
+            $click_steps .= ''
+                . '<p:par><p:cTn id="' . $cTn_outer . '" fill="hold">'
+                . '<p:stCondLst><p:cond delay="indefinite"/></p:stCondLst>'
+                . '<p:childTnLst><p:par><p:cTn id="' . $cTn_inner . '" fill="hold">'
+                . '<p:stCondLst><p:cond delay="0"/></p:stCondLst>'
+                . '<p:childTnLst><p:par><p:cTn id="' . $cTn_effect . '" presetID="1" presetClass="entr" presetSubtype="0" fill="hold" grpId="0" nodeType="clickEffect">'
+                . '<p:stCondLst><p:cond delay="0"/></p:stCondLst>'
+                . '<p:childTnLst><p:set>'
+                . '<p:cBhvr>'
+                . '<p:cTn id="' . $cTn_set . '" dur="1" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst></p:cTn>'
+                . '<p:tgtEl><p:spTgt spid="' . $shape_id . '"><p:txEl><p:pRg st="' . $p . '" end="' . $p . '"/></p:txEl></p:spTgt></p:tgtEl>'
+                . '<p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>'
+                . '</p:cBhvr>'
+                . '<p:to><p:strVal val="visible"/></p:to>'
+                . '</p:set></p:childTnLst>'
+                . '</p:cTn></p:par></p:childTnLst>'
+                . '</p:cTn></p:par></p:childTnLst>'
+                . '</p:cTn></p:par>';
+        }
+        $tmRoot_id = $next_id++;
+        $mainSeq_id = $next_id++;
+        return ''
+            . '<p:timing>'
+            . '<p:tnLst><p:par>'
+            . '<p:cTn id="' . $tmRoot_id . '" dur="indefinite" restart="never" nodeType="tmRoot">'
+            . '<p:childTnLst><p:seq concurrent="1" nextAc="seek">'
+            . '<p:cTn id="' . $mainSeq_id . '" dur="indefinite" nodeType="mainSeq"><p:childTnLst>'
+            . $click_steps
+            . '</p:childTnLst></p:cTn>'
+            . '<p:prevCondLst><p:cond evt="onPrev" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond></p:prevCondLst>'
+            . '<p:nextCondLst><p:cond evt="onNext" delay="0"><p:tgtEl><p:sldTgt/></p:tgtEl></p:cond></p:nextCondLst>'
+            . '</p:seq></p:childTnLst>'
+            . '</p:cTn>'
+            . '</p:par></p:tnLst>'
+            . '<p:bldLst><p:bldP spid="' . $shape_id . '" grpId="0" build="p"/></p:bldLst>'
+            . '</p:timing>';
+    }
+}
