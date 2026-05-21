@@ -267,15 +267,20 @@ class Test extends \PHPUnit\Framework\TestCase
         }
     }
 
-    public function test__default_skeleton_baked_modern_theme(): void
+    public function test__render_without_overrides_preserves_skeleton_theme(): void
     {
-        // No theme overrides: bundled skeleton's baked-in modern defaults
-        // (deep blue accent1, amber accent2, Aptos fonts) should survive.
+        // Render without color/font overrides must leave the skeleton's
+        // theme1.xml byte-identical in the output — regardless of what
+        // colors/fonts the skeleton happens to ship with.
         $out = sys_get_temp_dir() . '/ppthelper_test_default.pptx';
         @unlink($out);
         ppthelper::render(['input_markdown' => '# Default look', 'output' => $out]);
-        $theme = self::loadThemeXml($out);
-        $this->assertMatchesRegularExpression('#<a:accent1>\s*<a:srgbClr val="1F4E79"/>#', $theme);
-        $this->assertMatchesRegularExpression('#<a:majorFont>.*?<a:latin typeface="Aptos Display"#s', $theme);
+
+        $zip = new ZipArchive();
+        $zip->open(dirname(__DIR__) . '/assets/skeleton.pptx');
+        $skeleton_theme = $zip->getFromName('ppt/theme/theme1.xml');
+        $zip->close();
+
+        $this->assertSame($skeleton_theme, self::loadThemeXml($out));
     }
 }
