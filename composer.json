@@ -14,5 +14,8 @@
     },
     "require-dev": {
         "phpunit/phpunit": "^10 || ^11"
-    }
+    },
+    "bin": [
+        "src/mcp-server.php"
+    ]
 }

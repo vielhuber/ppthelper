@@ -147,23 +147,21 @@ class ppthelper
      * The markdown follows Pandoc's slideshow conventions:
      *   - First three lines `% Title`, `% Author`, `% Date` become the title slide.
      *   - Each `# Heading` starts a new slide; the body is its content.
-     *   - Two-column layouts via `::: {.columns}` / `::: {.column}` fences.
+     *   - Two-column layouts via `::: {.columns}` / `::: {.column}` fences
+     *     (pandoc caps at two — for 3+ side-by-side use a Markdown table).
      *   - Tables, fenced code, bullets, ordered lists, images, math: all
      *     standard Pandoc-Markdown.
-     *   - Inline images: `![alt](/host/data/files/[CHAT_ID]/<name>.png)`.
      *
      * @param string $markdown The complete deck as one Pandoc-Markdown blob.
-     * @param string|null $primary_color Hex color (e.g. "#1F4E79") for headings and primary accents. Default keeps the skeleton's #1F4E79.
-     * @param string|null $accent_color Hex color (e.g. "#F59E0B") for secondary accents (charts, links). Default keeps the skeleton's #F59E0B.
-     * @param string|null $background_color Hex color (e.g. "#FFFFFF") for the slide background. Default white.
-     * @param string|null $text_color Hex color (e.g. "#111827") for body text. Default near-black.
+     * @param string|null $primary_color Hex color (e.g. "#1F4E79") for headings and primary accents.
+     * @param string|null $accent_color Hex color (e.g. "#F59E0B") for secondary accents.
+     * @param string|null $background_color Hex color (e.g. "#FFFFFF") for the slide background.
+     * @param string|null $text_color Hex color (e.g. "#111827") for body text.
      * @param string|null $heading_font Font family for headings, e.g. "Aptos Display", "Inter", "Calibri". ASCII letters/digits/space/dash only, max 64 chars.
      * @param string|null $body_font Font family for body text, e.g. "Aptos", "Inter", "Calibri".
      * @param string|null $transitions Slide transition applied to every slide. One of: null (none), "fade", "slide".
      * @param bool|null $animations When true, body bullets appear one click at a time (PowerPoint "Appear → By Paragraph").
-     * @param string|null $filename Output filename only (e.g. "deck.pptx"), no directory path. Defaults to an auto-name.
-     * @param string $chat_id Current chat UUID — injected by the URL routing layer.
-     * @param string|null $chat_message_id Injected by the URL routing layer (unused).
+     * @param string|null $output Output path. Relative paths resolve against the caller's cwd. If null, a tempfile is used and its path returned.
      * @return array{path: string} Path to the generated .pptx file.
      */
     #[McpTool(name: 'render_deck')]
@@ -177,16 +175,8 @@ class ppthelper
         ?string $body_font = null,
         ?string $transitions = null,
         ?bool $animations = null,
-        ?string $filename = null,
-        ?string $chat_id = null,
-        ?string $chat_message_id = null
+        ?string $output = null
     ): array {
-        if (($chat_id ?? '') === '') {
-            throw new RuntimeException(
-                'Parameter "chat_id" was not injected by the URL routing layer. The MCP url must include [CHAT_ID].'
-            );
-        }
-        $output = '/host/data/files/' . $chat_id . '/' . self::resolveMcpFilename($filename);
         $path = self::render([
             'input_markdown' => $markdown,
             'output' => $output,
@@ -310,22 +300,6 @@ class ppthelper
                 'ppthelper::render: pandoc failed (exit ' . $exit . '): ' . trim($stderr !== '' ? $stderr : $stdout)
             );
         }
-    }
-
-    private static function resolveMcpFilename(?string $filename): string
-    {
-        if ($filename === null || $filename === '') {
-            return 'deck_' . date('Ymd_His') . '.pptx';
-        }
-        // strip any directory traversal; only the basename is allowed
-        $basename = basename($filename);
-        if ($basename === '' || $basename !== $filename) {
-            throw new RuntimeException('Parameter "filename" must be a bare filename without path components.');
-        }
-        if (!str_ends_with(strtolower($basename), '.pptx')) {
-            $basename .= '.pptx';
-        }
-        return $basename;
     }
 
     // ====================================================================
@@ -559,7 +533,7 @@ class ppthelper
      */
     private static function findBodyTarget(string $xml): ?array
     {
-        if (preg_match_all('#<p:sp\b[^>]*>(.*?)</p:sp>#s', $xml, $matches) !== 1 && empty($matches[0])) {
+        if (preg_match_all('#<p:sp\b[^>]*>(.*?)</p:sp>#s', $xml, $matches) < 1) {
             return null;
         }
         foreach ($matches[0] as $sp) {

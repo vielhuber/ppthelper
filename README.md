@@ -28,7 +28,7 @@ require __DIR__ . '/vendor/autoload.php';
 use vielhuber\ppthelper\ppthelper;
 ```
 
-[pandoc](https://pandoc.org/) must be installed and reachable on `$PATH` (or pass an explicit `pandoc_bin`).
+[pandoc](https://pandoc.org/) must be installed and reachable on `$PATH` (or pass an explicit `pandoc_path`).
 
 ## usage
 
@@ -134,4 +134,14 @@ $path = ppthelper::render([
 
 ### mcp server
 
-ppthelper also ships as an [mcp](https://modelcontextprotocol.io/) tool for ai-agent workflows. exposes a single tool `render_deck(markdown, primary_color?, accent_color?, background_color?, text_color?, heading_font?, body_font?, filename?)` that calls `ppthelper::render` under the hood.
+ppthelper ships as a standalone [mcp](https://modelcontextprotocol.io/) server for ai-agent workflows, exposing a single tool `render_deck` that wraps `ppthelper::render`.
+
+```
+cp vendor/vielhuber/ppthelper/src/.env.example vendor/vielhuber/ppthelper/src/.env
+# edit the .env and set MCP_TOKEN to a private value
+vendor/bin/mcp-server.php
+```
+
+the server speaks both stdio (CLI invocation) and HTTP via [simplemcp](https://github.com/vielhuber/simplemcp). `auth: 'static'` mode expects the bearer token in `MCP_TOKEN`.
+
+the tool exposes `render_deck(markdown, primary_color?, accent_color?, background_color?, text_color?, heading_font?, body_font?, transitions?, animations?, filename?)`. without a `chat_id` the deck lands in the caller's working directory; with one (charly injects it via url placeholder) the deck is written into `/host/data/files/<chat_id>/` so a host worker can attach it to a chat reply.
