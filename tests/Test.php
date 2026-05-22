@@ -527,6 +527,91 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__quote_slide_remapped_when_skeleton_has_quote_layout(): void
+    {
+        // Pandoc renders `> text` blockquotes with marL="1270000" + <a:buNone/>.
+        // When the entire body of a slide is such paragraphs, ppthelper remaps
+        // the layout to the skeleton's quote-named layout.
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $quote_layout = null;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (
+                is_string($x) &&
+                preg_match('#<p:cSld\b[^>]*\bname="([^"]+)"#', $x, $nm) === 1 &&
+                preg_match('#(zitat|quote)#i', $nm[1]) === 1
+            ) {
+                $quote_layout = basename($n);
+                break;
+            }
+        }
+        $z->close();
+        if ($quote_layout === null) {
+            $this->markTestSkipped('bundled skeleton has no quote/zitat layout — remap is a no-op');
+        }
+        $md = "# Worth quoting\n\n> Lorem ipsum dolor sit amet.\n>\n> — Cicero, 45 BC";
+        $out = sys_get_temp_dir() . '/ppthelper_test_quote_remap.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $z = new ZipArchive();
+        $z->open($out);
+        $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
+        $z->close();
+        $this->assertStringContainsString(
+            $quote_layout,
+            $rels,
+            'blockquote-only slide must be remapped to the skeleton quote layout'
+        );
+    }
+
+    public function test__non_quote_slide_keeps_default_layout(): void
+    {
+        // Plain content slide (bullets, not blockquote) must NOT be remapped
+        // to the quote layout.
+        $md = "# Normal content\n\n- not a quote\n- regular bullet";
+        $out = sys_get_temp_dir() . '/ppthelper_test_quote_skip.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $quote_layout = null;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (
+                is_string($x) &&
+                preg_match('#<p:cSld\b[^>]*\bname="([^"]+)"#', $x, $nm) === 1 &&
+                preg_match('#(zitat|quote)#i', $nm[1]) === 1
+            ) {
+                $quote_layout = basename($n);
+                break;
+            }
+        }
+        $z->close();
+        if ($quote_layout === null) {
+            $this->markTestSkipped('no quote layout in skeleton — nothing to keep away from');
+        }
+        $z = new ZipArchive();
+        $z->open($out);
+        $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
+        $z->close();
+        $this->assertStringNotContainsString(
+            $quote_layout,
+            $rels,
+            'normal content slide must stay on its original layout'
+        );
+    }
+
     public function test__sldnum_stub_injected_on_every_slide(): void
     {
         // Pandoc never writes sldNum. The post-process injects a live

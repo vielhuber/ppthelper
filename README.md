@@ -150,6 +150,21 @@ the default for any `# heading` followed by body text.
 
 keep it to 3–5 bullets, ~80 chars each. pandoc rendering doesn't reflow, and `<a:normAutofit/>` (ppthelper adds it automatically) only shrinks down to ~70% before things turn unreadable.
 
+#### quote slide
+
+a `# heading` followed by a body that consists entirely of markdown blockquote (`> …`) lines. ppthelper detects this (via the marL="1270000" + no-bullet marker pandoc emits) and remaps the slide onto the skeleton's quote/zitat layout (larger italic body, accent caption).
+
+```markdown
+# Worth quoting
+
+> Künstliche Intelligenz wird nicht jeden Job zerstören.
+> Aber jeder Job wird sich verändern.
+>
+> — Andrew Ng, Stanford 2024
+```
+
+best used sparingly — 1 quote per ~15–20 content slides reads as a rhetorical anchor; more often than that feels gimmicky.
+
 #### section-header slide
 
 write a `# heading` with **no body** between it and the next `# heading`. ppthelper detects the empty body and remaps the slide onto the skeleton's section-header layout (larger title, accent background).

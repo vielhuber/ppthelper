@@ -156,6 +156,15 @@ class ppthelper
             self::remapSectionHeaderSlides($output, $sec_layout);
         }
 
+        // Pandoc renders markdown blockquote (`> text`) into content paragraphs
+        // with marL="1270000" + <a:buNone/>. When a slide's body is entirely
+        // such paragraphs, remap it to the skeleton's quote-typed layout
+        // (e.g. "Zitat mit Beschriftung") for visual distinction.
+        $quote_layout = self::findQuoteLayout($template);
+        if ($quote_layout !== null) {
+            self::remapQuoteSlides($output, $quote_layout);
+        }
+
         // Pandoc emits each slide with only title/body/date placeholders.
         // Skeleton layouts often also contain sldNum and ftr placeholders —
         // when those don't exist in the slide itself, PowerPoint falls back
@@ -505,7 +514,11 @@ class ppthelper
                         if ($row_count < 5) {
                             return $gf;
                         }
-                        $needed_cy = $row_count * 380000 + 100000;
+                        // 500k EMU per row ≈ 0.55" — comfortable headroom for
+                        // ~14pt body text in a single line; rows with wrapping
+                        // text still risk overflowing, hence the skill says max
+                        // ~5 rows per slide and split longer tables across slides
+                        $needed_cy = $row_count * 500000 + 100000;
                         $patched = preg_replace_callback(
                             '#<a:ext\s+cx="(\d+)"\s+cy="(\d+)"\s*/>#',
                             static function (array $em) use ($needed_cy): string {
@@ -644,6 +657,128 @@ class ppthelper
                 if (is_string($new_slide_xml) && $new_slide_xml !== $slide_xml) {
                     $zip->deleteName($name);
                     $zip->addFromString($name, $new_slide_xml);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Locate the skeleton's quote/Zitat layout by name. Unlike section-header
+     * (which is identifiable via `type="secHead"`), quote layouts use the
+     * generic `type="title"` and only differ by their cSld name. Match on
+     * substring "quote" or "zitat" (case-insensitive). Returns the layout
+     * basename or null if no such layout exists.
+     */
+    private static function findQuoteLayout(string $template_path): ?string
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($template_path) !== true) {
+            return null;
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                if (preg_match('#<p:cSld\b[^>]*\bname="([^"]+)"#', $xml, $nm) !== 1) {
+                    continue;
+                }
+                if (preg_match('#(zitat|quote)#i', $nm[1]) === 1) {
+                    return basename($name);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+        return null;
+    }
+
+    /**
+     * A slide whose body consists entirely of pandoc-rendered blockquote
+     * paragraphs (marL="1270000" + <a:buNone/>) gets remapped to the
+     * skeleton's quote layout. Skips slides with tables, pictures, or any
+     * non-blockquote body paragraph so we don't hijack normal content.
+     */
+    private static function remapQuoteSlides(string $output_path, string $quote_layout_name): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for quote remap: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide(\d+)\.xml$#', $name, $sm) !== 1) {
+                    continue;
+                }
+                $slide_xml = $zip->getFromIndex($i);
+                if (!is_string($slide_xml)) {
+                    continue;
+                }
+                if (str_contains($slide_xml, '<p:graphicFrame') || str_contains($slide_xml, '<p:pic')) {
+                    continue;
+                }
+                if (preg_match('#<p:ph\b[^/]*\btype="ctrTitle"#', $slide_xml) === 1) {
+                    continue;
+                }
+                // examine the content placeholder (the non-title, non-system
+                // <p:sp> with body text) — every <a:p> must look like a
+                // blockquote paragraph for the slide to qualify
+                $is_quote = false;
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $slide_xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        // collect every <a:p> in this body placeholder
+                        if (preg_match_all('#<a:p\b.*?</a:p>#s', $sp, $paras) === false) {
+                            continue;
+                        }
+                        $any_para = false;
+                        $all_quote = true;
+                        foreach ($paras[0] as $para) {
+                            // skip empty paragraphs (whitespace-only or pure endParaRPr)
+                            if (preg_match('#<a:t>\s*\S#', $para) !== 1) {
+                                continue;
+                            }
+                            $any_para = true;
+                            $is_blockquote_para = preg_match('#<a:pPr\b[^/]*\bmarL="1270000"[^/]*/?>#', $para) === 1
+                                || preg_match('#<a:pPr\b[^>]*\bmarL="1270000"#', $para) === 1;
+                            if (!$is_blockquote_para) {
+                                $all_quote = false;
+                                break;
+                            }
+                        }
+                        if ($any_para && $all_quote) {
+                            $is_quote = true;
+                            break;
+                        }
+                    }
+                }
+                if (!$is_quote) {
+                    continue;
+                }
+                $rels_name = 'ppt/slides/_rels/slide' . $sm[1] . '.xml.rels';
+                $rels_xml = $zip->getFromName($rels_name);
+                if (!is_string($rels_xml)) {
+                    continue;
+                }
+                $new_rels = preg_replace(
+                    '#Target="\.\./slideLayouts/slideLayout\d+\.xml"#',
+                    'Target="../slideLayouts/' . $quote_layout_name . '"',
+                    $rels_xml,
+                    1
+                );
+                if (is_string($new_rels) && $new_rels !== $rels_xml) {
+                    $zip->deleteName($rels_name);
+                    $zip->addFromString($rels_name, $new_rels);
                 }
             }
         } finally {
