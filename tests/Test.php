@@ -652,6 +652,101 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__image_alt_caption_is_stripped(): void
+    {
+        // Pandoc renders `![governance](path)` with the alt-text as a free
+        // <p:sp txBox="1"> caption below the picture. On compact slide
+        // formats this caption collides with the master footer zone; we
+        // strip all free text boxes (no <p:ph>) so the picture stands clean.
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $md = "# Bild\n\n![Governance](" . $skeleton . ")";
+        $out = sys_get_temp_dir() . '/ppthelper_test_caption_strip.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide = self::loadSlideXml($out, 1);
+        // There must not be a free TextBox shape (txBox="1" without <p:ph>).
+        $this->assertDoesNotMatchRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?txBox="1"(?:(?!</p:sp>)(?!<p:ph\b).)*?</p:sp>#s',
+            $slide,
+            'free text-box image captions must be stripped'
+        );
+        // The picture itself must still be there
+        $this->assertMatchesRegularExpression(
+            '#<p:pic\b#',
+            $slide,
+            'the picture must survive the caption strip'
+        );
+        // accessibility: alt-text preserved on the picture descr attribute
+        $this->assertMatchesRegularExpression(
+            '#<p:pic\b[^>]*>(?:(?!</p:pic>).)*?descr="[^"]+"#s',
+            $slide,
+            'picture alt-text (descr) must be preserved for accessibility'
+        );
+    }
+
+    public function test__single_body_with_picture_goes_to_unoccupied_column(): void
+    {
+        // Pandoc renders "two-column image + bullets" as a free <p:pic>
+        // (hardcoded x of the left column) + one body placeholder for the
+        // bullets. The bullets must be mapped to the layout body in the
+        // OTHER column, not the one already occupied by the picture.
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        // find the two-content layout (twoObj) and inspect its bodies
+        $layout_id = null;
+        $bodies = [];
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout(\d+)\.xml$#', $n, $sm) !== 1) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (is_string($x) && preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $x) === 1) {
+                $layout_id = (int) $sm[1];
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $x, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) === 1
+                            && preg_match('#<a:off x="(\d+)"#', $sp, $om) === 1
+                        ) {
+                            $bodies[] = ['idx' => $im[1], 'x' => (int) $om[1]];
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        $z->close();
+        if ($layout_id === null || count($bodies) < 2) {
+            $this->markTestSkipped('skeleton has no two-content layout with 2 bodies');
+        }
+        usort($bodies, static fn($a, $b) => $a['x'] <=> $b['x']);
+        $left_idx = $bodies[0]['idx'];
+        $right_idx = $bodies[1]['idx'];
+
+        $md = "# Two col with pic\n\n:::: {.columns}\n::: {.column}\n![hero](" . $skeleton . ")\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::";
+        $out = sys_get_temp_dir() . '/ppthelper_test_pic_aware.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide = self::loadSlideXml($out, 1);
+
+        // The bullets must be in the right-column body (not the same column as the picture)
+        $this->assertMatchesRegularExpression(
+            '#<p:ph\b[^/]*\bidx="' . preg_quote($right_idx, '#') . '"(?:(?!</p:sp>).)*?RIGHT_BULLET#s',
+            $slide,
+            'bullet body must be mapped to the un-occupied right-column body-idx (' . $right_idx . '), not under the picture'
+        );
+        // and NOT in the left-column idx
+        $this->assertDoesNotMatchRegularExpression(
+            '#<p:ph\b[^/]*\bidx="' . preg_quote($left_idx, '#') . '"(?:(?!</p:sp>).)*?RIGHT_BULLET#s',
+            $slide,
+            'bullet body must NOT be on the left (picture occupies that column)'
+        );
+    }
+
     public function test__two_column_idx_mapped_in_reading_order(): void
     {
         // Pandoc emits left=idx="1", right=idx="2" for two-column slides.

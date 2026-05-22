@@ -174,6 +174,15 @@ class ppthelper
         // gets matched against the final layout it actually points to.
         self::normalizeBodyPlaceholderIndices($output);
 
+        // Pandoc renders the alt-text of every `![alt](path)` as a free
+        // <p:sp txBox="1"> caption directly under the picture. On compact
+        // slide formats (< 6.5" height) this caption pushes into the master
+        // footer decoration zone; in business decks it's rarely wanted at
+        // all. Strip all free text-boxes (= shapes with txBox="1" and no
+        // <p:ph>) so the only caption is the image's alt-attribute on the
+        // <p:pic> (still preserved for accessibility).
+        self::stripFreeTextBoxes($output);
+
         // Pandoc emits each slide with only title/body/date placeholders.
         // Skeleton layouts often also contain sldNum and ftr placeholders —
         // when those don't exist in the slide itself, PowerPoint falls back
@@ -830,6 +839,56 @@ class ppthelper
     }
 
     /**
+     * Remove every free <p:sp txBox="1"> shape that has no <p:ph> — these are
+     * Pandoc's image-caption text boxes (the alt-text of `![alt](path)`).
+     * They live as floating shapes directly under the picture; on compact
+     * slide heights they intrude into the master footer zone, and on
+     * business decks they're usually unwanted decoration. The picture's
+     * <p:cNvPr descr="..."/> alt attribute is preserved for accessibility.
+     */
+    private static function stripFreeTextBoxes(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for caption strip: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $new_xml = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m): string {
+                        $sp = $m[0];
+                        // a free text box has txBox="1" on <p:cNvSpPr> and
+                        // no <p:ph> child anywhere
+                        if (strpos($sp, 'txBox="1"') === false) {
+                            return $sp;
+                        }
+                        if (preg_match('#<p:ph\b#', $sp) === 1) {
+                            return $sp;
+                        }
+                        return '';
+                    },
+                    $xml
+                );
+                if (is_string($new_xml) && $new_xml !== $xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $new_xml);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
      * Re-anchor each slide's body placeholders onto the indices the layout
      * actually provides. Pandoc hard-codes `<p:ph idx="1">` (and "2" for the
      * second column in two-content layouts) — custom skeletons frequently use
@@ -927,15 +986,56 @@ class ppthelper
                     continue;
                 }
 
+                // collect any free <p:pic> shapes with a position — Pandoc
+                // emits two-column "image + bullets" markdown as one floating
+                // <p:pic> (hardcoded x of the left column) plus one body
+                // placeholder for the bullets. The body must then go in the
+                // OTHER (un-occupied) column, not under the picture.
+                $pic_positions = [];
+                if (preg_match_all('#<p:pic\b[^>]*>.*?</p:pic>#s', $slide_xml, $pics) !== false) {
+                    foreach ($pics[0] as $pic) {
+                        if (preg_match('#<a:off x="(\d+)" y="(\d+)"#', $pic, $pom) === 1
+                            && preg_match('#<a:ext cx="(\d+)" cy="(\d+)"#', $pic, $pem) === 1
+                        ) {
+                            $pic_positions[] = ['x' => (int) $pom[1], 'cx' => (int) $pem[1]];
+                        }
+                    }
+                }
+
                 // build idx → idx mapping
                 $mapping = [];
                 if (count($slide_bodies) === 1) {
-                    // single body — map onto the layout's largest-cy body
-                    $sorted = $layout_b;
-                    usort($sorted, static fn($a, $b) => $b['cy'] <=> $a['cy']);
-                    $target = $sorted[0]['idx'];
-                    if ($slide_bodies[0] !== $target) {
-                        $mapping[$slide_bodies[0]] = $target;
+                    // single body — but watch out for pictures occupying a
+                    // layout column. choose the layout body that's furthest
+                    // from any picture (or, with no picture, the largest-cy one).
+                    if ($pic_positions !== []) {
+                        $best_idx = null;
+                        $best_distance = -1;
+                        foreach ($layout_b as $lb) {
+                            $min_dist = PHP_INT_MAX;
+                            $lb_center = $lb['x'] + (int) ($lb['cx'] / 2);
+                            foreach ($pic_positions as $pp) {
+                                $pp_center = $pp['x'] + (int) ($pp['cx'] / 2);
+                                $d = abs($lb_center - $pp_center);
+                                if ($d < $min_dist) {
+                                    $min_dist = $d;
+                                }
+                            }
+                            if ($min_dist > $best_distance) {
+                                $best_distance = $min_dist;
+                                $best_idx = $lb['idx'];
+                            }
+                        }
+                        if ($best_idx !== null && $slide_bodies[0] !== $best_idx) {
+                            $mapping[$slide_bodies[0]] = $best_idx;
+                        }
+                    } else {
+                        $sorted = $layout_b;
+                        usort($sorted, static fn($a, $b) => $b['cy'] <=> $a['cy']);
+                        $target = $sorted[0]['idx'];
+                        if ($slide_bodies[0] !== $target) {
+                            $mapping[$slide_bodies[0]] = $target;
+                        }
                     }
                 } else {
                     // multiple bodies — map by reading order (x asc, y asc)
