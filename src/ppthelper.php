@@ -146,6 +146,16 @@ class ppthelper
         // the fixed Pandoc box.
         self::fixSlideShapeGeometry($output);
 
+        // Pandoc's PPTX writer is hardcoded to ~3 layouts (title, title+content,
+        // two-content) — Markdown can't address "Section Header", "Picture with
+        // Caption", "Quote" etc. As a partial fix, detect slides that look like
+        // a section header (only a title, no body / no table / no picture) and
+        // remap them to the skeleton's secHead-typed layout.
+        $sec_layout = self::findSectionHeaderLayout($template);
+        if ($sec_layout !== null) {
+            self::remapSectionHeaderSlides($output, $sec_layout);
+        }
+
         self::validateOutput($output);
 
         // Post-process: transitions + animations.
@@ -463,7 +473,7 @@ class ppthelper
                     '#<p:sp\b[^>]*>.*?</p:sp>#s',
                     static function (array $m): string {
                         $sp = $m[0];
-                        if (preg_match('#<p:ph\b[^/]*\btype="(?:ctrTitle|dt|ftr|sldNum)"#', $sp) !== 1) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) !== 1) {
                             return $sp;
                         }
                         $stripped = preg_replace('#<a:xfrm>.*?</a:xfrm>#s', '', $sp, 1);
@@ -507,6 +517,126 @@ class ppthelper
                 }
                 $zip->deleteName($name);
                 $zip->addFromString($name, $new_xml);
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Look up the skeleton's "Section Header"-typed layout (OOXML attribute
+     * type="secHead" on <p:sldLayout>) and return its basename, or null if the
+     * skeleton has no such layout. Used by remapSectionHeaderSlides.
+     */
+    private static function findSectionHeaderLayout(string $template_path): ?string
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($template_path) !== true) {
+            return null;
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (is_string($xml) && preg_match('#<p:sldLayout\b[^>]*\btype="secHead"#', $xml) === 1) {
+                    return basename($name);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+        return null;
+    }
+
+    /**
+     * Detect "section header" candidate slides (only a title placeholder; no
+     * body content, no table, no picture) and remap their layout relationship
+     * to point at the skeleton's secHead layout. Also strips the Pandoc-set
+     * <a:xfrm> off the title placeholder in those slides so the title falls
+     * back to the section-layout's intended (typically larger / centered)
+     * position instead of staying at the title+content geometry Pandoc wrote.
+     */
+    private static function remapSectionHeaderSlides(string $output_path, string $section_layout_name): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for section-header remap: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide(\d+)\.xml$#', $name, $sm) !== 1) {
+                    continue;
+                }
+                $slide_xml = $zip->getFromIndex($i);
+                if (!is_string($slide_xml)) {
+                    continue;
+                }
+                if (str_contains($slide_xml, '<p:graphicFrame') || str_contains($slide_xml, '<p:pic')) {
+                    continue;
+                }
+                $has_body = false;
+                if (preg_match_all('#<p:sp\b.*?</p:sp>#s', $slide_xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match(
+                            '#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#',
+                            $sp
+                        ) === 1) {
+                            continue;
+                        }
+                        // anything that's not a system placeholder + has actual
+                        // text counts as body content
+                        if (preg_match('#<a:t>\s*\S#', $sp) === 1) {
+                            $has_body = true;
+                            break;
+                        }
+                    }
+                }
+                if ($has_body) {
+                    continue;
+                }
+                // also skip the title slide itself (idx=1 with ctrTitle) — the
+                // very first slide is already a proper title slide.
+                if (preg_match('#<p:ph\b[^/]*\btype="ctrTitle"#', $slide_xml) === 1) {
+                    continue;
+                }
+                $rels_name = 'ppt/slides/_rels/slide' . $sm[1] . '.xml.rels';
+                $rels_xml = $zip->getFromName($rels_name);
+                if (!is_string($rels_xml)) {
+                    continue;
+                }
+                $new_rels = preg_replace(
+                    '#Target="\.\./slideLayouts/slideLayout\d+\.xml"#',
+                    'Target="../slideLayouts/' . $section_layout_name . '"',
+                    $rels_xml,
+                    1
+                );
+                if (is_string($new_rels) && $new_rels !== $rels_xml) {
+                    $zip->deleteName($rels_name);
+                    $zip->addFromString($rels_name, $new_rels);
+                }
+                // Strip the title's xfrm so it inherits the section-header
+                // layout's geometry (typically larger/centered) instead of
+                // staying at the title+content position Pandoc wrote.
+                $new_slide_xml = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m): string {
+                        $sp = $m[0];
+                        if (preg_match('#<p:ph\b[^/]*\btype="title"#', $sp) !== 1) {
+                            return $sp;
+                        }
+                        $stripped = preg_replace('#<a:xfrm>.*?</a:xfrm>#s', '', $sp, 1);
+                        return is_string($stripped) ? $stripped : $sp;
+                    },
+                    $slide_xml
+                );
+                if (is_string($new_slide_xml) && $new_slide_xml !== $slide_xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $new_slide_xml);
+                }
             }
         } finally {
             $zip->close();

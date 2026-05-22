@@ -485,6 +485,74 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__section_header_slide_remapped_to_secHead_layout(): void
+    {
+        // `# Heading` followed immediately by another `# Heading` (no body) is
+        // a section-header candidate. Pandoc itself doesn't pick secHead for
+        // PPTX, so our post-process must remap the layout relationship.
+        $md = "% Deck\n% Author\n% 22. Mai 2026\n\n# Part 1: Foundations\n\n# Slide One\n\n- bullet A\n\n# Slide Two\n\n- bullet B";
+        $out = sys_get_temp_dir() . '/ppthelper_test_sechead_remap.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        // slide2 should be the "Part 1: Foundations" section-header candidate.
+        $zip = new ZipArchive();
+        $zip->open($out);
+        $rels = $zip->getFromName('ppt/slides/_rels/slide2.xml.rels');
+        $zip->close();
+        $this->assertIsString($rels);
+        // skeleton.pptx ships with secHead = slideLayout3
+        $this->assertStringContainsString(
+            'slideLayouts/slideLayout3.xml',
+            $rels,
+            'empty-body slide must be remapped to skeleton secHead layout'
+        );
+    }
+
+    public function test__content_slide_keeps_default_layout(): void
+    {
+        // Plain title+bullets slide must NOT be remapped to secHead.
+        $md = "# Real Content\n\n- bullet ONE\n- bullet TWO";
+        $out = sys_get_temp_dir() . '/ppthelper_test_sechead_skip.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $zip = new ZipArchive();
+        $zip->open($out);
+        $rels = $zip->getFromName('ppt/slides/_rels/slide1.xml.rels');
+        $zip->close();
+        $this->assertIsString($rels);
+        $this->assertStringNotContainsString(
+            'slideLayouts/slideLayout3.xml',
+            $rels,
+            'content slide must stay on its original (title+content) layout'
+        );
+    }
+
+    public function test__subtitle_xfrm_stripped(): void
+    {
+        // The title-slide's subtitle placeholder used to overlap the centered
+        // title because Pandoc wrote a y=2914650 box that started before the
+        // layout's title-box ended (y=3583036). After our post-process the
+        // subtitle must have no xfrm so it inherits the layout's y=3583035.
+        $out = sys_get_temp_dir() . '/ppthelper_test_subtitle.pptx';
+        @unlink($out);
+        ppthelper::render([
+            'input_markdown' => "% Big Title\n% A Subtitle Here\n% 22. Mai 2026\n\n# Content slide\n\n- bullet",
+            'output' => $out
+        ]);
+        $slide1 = self::loadSlideXml($out, 1);
+        if (preg_match(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*type="subTitle"(?:(?!</p:sp>).)*?</p:sp>#s',
+            $slide1,
+            $m
+        ) === 1) {
+            $this->assertStringNotContainsString(
+                '<a:xfrm>',
+                $m[0],
+                'subTitle placeholder must lose its xfrm (overlaps ctrTitle otherwise)'
+            );
+        }
+    }
+
     public function test__small_table_keeps_cy(): void
     {
         // 3-row table: under the 5-row threshold, cy must stay as Pandoc set
