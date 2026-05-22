@@ -652,15 +652,26 @@ class ppthelper
     }
 
     /**
-     * Walk every slide and inject minimal <p:sp> stubs for sldNum and ftr
-     * placeholders whose corresponding layout defines one. Pandoc never
-     * writes these, which makes PowerPoint render the layout's literal
-     * "‹Nr.›" instead of the live slide-number field. A stub with an empty
-     * <p:spPr/> (no xfrm) inherits the layout's geometry, and the <a:fld
-     * type="slidenum"> inside it triggers live field substitution.
+     * Walk every slide and bring its system-placeholder presence in line with
+     * what the skeleton's layouts/master intend:
      *
-     * Skips the title slide (any slide containing a ctrTitle placeholder) so
-     * presentations keep the convention of no number/footer on the cover.
+     *  - sldNum: Pandoc never writes one, so PowerPoint falls back to the
+     *    layout's literal "‹Nr.›" instead of evaluating the slidenum field.
+     *    Inject a <p:sp> stub with a live <a:fld type="slidenum"> on every
+     *    slide (including the cover — counting from page 1 is consistent).
+     *
+     *  - dt: Pandoc writes the title-slide date as static text (e.g. "22. Mai
+     *    2026"). If the layout's dt placeholder has a datetime1 field — which
+     *    typically means a rotated/narrow design intended for the short
+     *    "22.05.2026" form — the long static text wraps to two lines. Replace
+     *    Pandoc's text run with a live datetime1 field so PowerPoint formats
+     *    it per the layout.
+     *
+     *  - ftr: only inject when the layout/master actually supplies a footer
+     *    payload (literal text or a live field). An empty stub triggers
+     *    PowerPoint's "Fußzeile" editor-hint with no payoff. With a real
+     *    payload the stub lets PowerPoint inherit and display the layout's
+     *    footer text on every slide.
      */
     private static function injectMissingSystemPlaceholders(string $output_path): void
     {
@@ -669,8 +680,9 @@ class ppthelper
             throw new RuntimeException('ppthelper::render: failed to open output for placeholder injection: ' . $output_path);
         }
         try {
-            // pre-compute which layouts define sldNum / ftr placeholders
-            $layout_has = [];
+            // pre-compute layout capabilities: has sldNum, is dt a live field,
+            // does ftr carry actual payload (text or live field)
+            $layout_caps = [];
             for ($i = 0; $i < $zip->numFiles; $i++) {
                 $name = $zip->getNameIndex($i);
                 if (!is_string($name) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $name) !== 1) {
@@ -680,10 +692,41 @@ class ppthelper
                 if (!is_string($xml)) {
                     continue;
                 }
-                $layout_has[basename($name)] = [
+                $dt_is_live = false;
+                if (preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s', $xml, $dt_block) === 1) {
+                    $dt_is_live = preg_match('#<a:fld\b[^>]*\btype="datetime1"#', $dt_block[0]) === 1;
+                }
+                $ftr_has_payload = false;
+                if (preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="ftr"(?:(?!</p:sp>).)*?</p:sp>#s', $xml, $ftr_block) === 1) {
+                    $has_text = preg_match('#<a:t>\s*\S#', $ftr_block[0]) === 1;
+                    $has_fld = strpos($ftr_block[0], '<a:fld') !== false;
+                    $ftr_has_payload = $has_text || $has_fld;
+                }
+                $layout_caps[basename($name)] = [
                     'sldNum' => preg_match('#<p:ph\b[^/]*\btype="sldNum"#', $xml) === 1,
-                    'ftr' => preg_match('#<p:ph\b[^/]*\btype="ftr"#', $xml) === 1,
+                    'dt_live' => $dt_is_live,
+                    'ftr_payload' => $ftr_has_payload,
                 ];
+            }
+            // also probe the master — if a layout's own ftr is silent but the
+            // master carries one, PowerPoint inherits via the master, so we
+            // still want to inject the stub on slides using such layouts
+            $master_ftr_payload = false;
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slideMasters/slideMaster\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $mx = $zip->getFromIndex($i);
+                if (!is_string($mx)) {
+                    continue;
+                }
+                if (preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="ftr"(?:(?!</p:sp>).)*?</p:sp>#s', $mx, $mftr) === 1) {
+                    if (preg_match('#<a:t>\s*\S#', $mftr[0]) === 1 || strpos($mftr[0], '<a:fld') !== false) {
+                        $master_ftr_payload = true;
+                        break;
+                    }
+                }
             }
             // visit each slide
             for ($i = 0; $i < $zip->numFiles; $i++) {
@@ -695,10 +738,6 @@ class ppthelper
                 if (!is_string($slide_xml)) {
                     continue;
                 }
-                // skip the title cover — no slide number / footer there
-                if (preg_match('#<p:ph\b[^/]*\btype="ctrTitle"#', $slide_xml) === 1) {
-                    continue;
-                }
                 // resolve which layout this slide uses
                 $rels_xml = $zip->getFromName('ppt/slides/_rels/slide' . $sm[1] . '.xml.rels');
                 if (!is_string($rels_xml)) {
@@ -707,14 +746,17 @@ class ppthelper
                 if (preg_match('#Target="\.\./slideLayouts/(slideLayout\d+\.xml)"#', $rels_xml, $lm) !== 1) {
                     continue;
                 }
-                $layout_basename = $lm[1];
-                $caps = $layout_has[$layout_basename] ?? null;
+                $caps = $layout_caps[$lm[1]] ?? null;
                 if ($caps === null) {
                     continue;
                 }
-                $additions = '';
-                if ($caps['sldNum'] && preg_match('#<p:ph\b[^/]*\btype="sldNum"#', $slide_xml) !== 1) {
-                    $additions .= '<p:sp>'
+                $new_xml = $slide_xml;
+                // sldNum injection — every slide including the cover
+                if (
+                    $caps['sldNum'] &&
+                    preg_match('#<p:ph\b[^/]*\btype="sldNum"#', $new_xml) !== 1
+                ) {
+                    $stub = '<p:sp>'
                         . '<p:nvSpPr>'
                         . '<p:cNvPr id="1001" name="Slide Number Placeholder"/>'
                         . '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>'
@@ -732,9 +774,19 @@ class ppthelper
                         . '</a:p>'
                         . '</p:txBody>'
                         . '</p:sp>';
+                    $patched = preg_replace('#</p:spTree>#', $stub . '</p:spTree>', $new_xml, 1);
+                    if (is_string($patched)) {
+                        $new_xml = $patched;
+                    }
                 }
-                if ($caps['ftr'] && preg_match('#<p:ph\b[^/]*\btype="ftr"#', $slide_xml) !== 1) {
-                    $additions .= '<p:sp>'
+                // ftr injection only when the layout's or master's ftr carries
+                // actual payload — otherwise PowerPoint shows its "Fußzeile"
+                // editor-hint for nothing.
+                if (
+                    ($caps['ftr_payload'] || $master_ftr_payload) &&
+                    preg_match('#<p:ph\b[^/]*\btype="ftr"#', $new_xml) !== 1
+                ) {
+                    $stub = '<p:sp>'
                         . '<p:nvSpPr>'
                         . '<p:cNvPr id="1002" name="Footer Placeholder"/>'
                         . '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>'
@@ -747,13 +799,47 @@ class ppthelper
                         . '<a:p><a:endParaRPr lang="de-DE"/></a:p>'
                         . '</p:txBody>'
                         . '</p:sp>';
+                    $patched = preg_replace('#</p:spTree>#', $stub . '</p:spTree>', $new_xml, 1);
+                    if (is_string($patched)) {
+                        $new_xml = $patched;
+                    }
                 }
-                if ($additions === '') {
-                    continue;
+                // dt: if the layout's date placeholder is a live field, rewrite
+                // Pandoc's static text into a live field too (compact format,
+                // fits rotated/narrow layout boxes).
+                if ($caps['dt_live']) {
+                    $new_xml = preg_replace_callback(
+                        '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
+                        static function (array $dm): string {
+                            $sp = $dm[0];
+                            if (str_contains($sp, '<a:fld')) {
+                                return $sp;
+                            }
+                            // build a fresh <a:p> with a live datetime1 field, keep
+                            // the existing text (if any) as the placeholder value
+                            // PowerPoint shows before evaluating the field
+                            $existing_text = '21.05.2026';
+                            if (preg_match('#<a:t>([^<]+)</a:t>#', $sp, $tm) === 1) {
+                                $existing_text = $tm[1];
+                            }
+                            $field_para = '<a:p>'
+                                . '<a:fld id="{AA5AE68C-7E05-4013-BF21-9B93BA55A149}" type="datetime1">'
+                                . '<a:rPr lang="de-DE" smtClean="0"/>'
+                                . '<a:t>' . htmlspecialchars($existing_text, ENT_XML1 | ENT_QUOTES, 'UTF-8') . '</a:t>'
+                                . '</a:fld>'
+                                . '</a:p>';
+                            $rewritten = preg_replace(
+                                '#<a:p\b.*?</a:p>#s',
+                                $field_para,
+                                $sp,
+                                1
+                            );
+                            return is_string($rewritten) ? $rewritten : $sp;
+                        },
+                        $new_xml
+                    ) ?? $new_xml;
                 }
-                // inject right before </p:spTree>
-                $new_xml = preg_replace('#</p:spTree>#', $additions . '</p:spTree>', $slide_xml, 1);
-                if (is_string($new_xml) && $new_xml !== $slide_xml) {
+                if ($new_xml !== $slide_xml) {
                     $zip->deleteName($name);
                     $zip->addFromString($name, $new_xml);
                 }

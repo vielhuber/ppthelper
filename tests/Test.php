@@ -527,33 +527,122 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
-    public function test__sldnum_stub_injected_on_content_slides(): void
+    public function test__sldnum_stub_injected_on_every_slide(): void
     {
-        // Pandoc never writes sldNum/ftr. The post-process must inject a
-        // <p:ph type="sldNum"> stub with a live slidenum field so PowerPoint
-        // can substitute the actual number instead of the layout's "‹Nr.›"
-        // default text. Title cover must be exempt.
+        // Pandoc never writes sldNum. The post-process injects a live
+        // slidenum field on EVERY slide including the cover so PowerPoint
+        // renders consecutive numbers starting at 1.
         $md = "% Cover\n% Author\n% 22. Mai 2026\n\n# Content slide\n\n- bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_sldnum.pptx';
         @unlink($out);
         ppthelper::render(['input_markdown' => $md, 'output' => $out]);
-        $slide1 = self::loadSlideXml($out, 1);  // title cover
-        $slide2 = self::loadSlideXml($out, 2);  // content slide
+        $slide1 = self::loadSlideXml($out, 1);
+        $slide2 = self::loadSlideXml($out, 2);
+        foreach ([$slide1, $slide2] as $slide) {
+            $this->assertMatchesRegularExpression(
+                '#<p:ph\b[^/]*\btype="sldNum"#',
+                $slide,
+                'every slide must carry an injected sldNum stub'
+            );
+            $this->assertMatchesRegularExpression(
+                '#<a:fld\b[^>]*type="slidenum"#',
+                $slide,
+                'sldNum stub must contain a live slidenum field'
+            );
+        }
+    }
+
+    public function test__ftr_stub_skipped_when_layout_and_master_empty(): void
+    {
+        // The bundled skeleton has an empty ftr placeholder in every layout
+        // and the master — no payload to display. Stub injection would only
+        // trigger PowerPoint's "Fußzeile" editor-hint, so it must be a no-op.
+        $md = "% Cover\n% Author\n% 22. Mai 2026\n\n# Content\n\n- bullet";
+        $out = sys_get_temp_dir() . '/ppthelper_test_no_ftr.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        // probe the skeleton itself — only assert "no stub" when it really
+        // has no payload, otherwise the assertion is meaningless
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $any_ftr_payload = false;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n)) {
+                continue;
+            }
+            if (
+                preg_match('#^ppt/(slideLayouts/slideLayout|slideMasters/slideMaster)\d+\.xml$#', $n) !== 1
+            ) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (
+                is_string($x) &&
+                preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="ftr"(?:(?!</p:sp>).)*?</p:sp>#s', $x, $m) === 1 &&
+                (preg_match('#<a:t>\s*\S#', $m[0]) === 1 || strpos($m[0], '<a:fld') !== false)
+            ) {
+                $any_ftr_payload = true;
+                break;
+            }
+        }
+        $z->close();
+        if ($any_ftr_payload) {
+            $this->markTestSkipped('skeleton ships with non-empty footer — stub IS expected, not testing the empty path');
+        }
+        $slide2 = self::loadSlideXml($out, 2);
         $this->assertDoesNotMatchRegularExpression(
-            '#<p:ph\b[^/]*\btype="sldNum"#',
+            '#<p:ph\b[^/]*\btype="ftr"#',
+            $slide2,
+            'with empty layout/master ftr, no stub should be injected'
+        );
+    }
+
+    public function test__dt_rewritten_to_live_field_when_layout_uses_one(): void
+    {
+        // The post-process rewrites Pandoc's static date text into a live
+        // <a:fld type="datetime1"> ONLY when the layout's own dt placeholder
+        // uses one (rotated/narrow boxes need the compact PowerPoint format).
+        // Skip when the bundled skeleton ships a layout that already uses
+        // static text — the rewrite is intentionally a no-op there.
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $layout1 = $z->getFromName('ppt/slideLayouts/slideLayout1.xml');
+        $z->close();
+        $layout_has_live_dt = false;
+        if (
+            is_string($layout1) &&
+            preg_match(
+                '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
+                $layout1,
+                $dtm
+            ) === 1
+        ) {
+            $layout_has_live_dt = preg_match('#<a:fld\b[^>]*type="datetime1"#', $dtm[0]) === 1;
+        }
+        if (!$layout_has_live_dt) {
+            $this->markTestSkipped('bundled skeleton layout1 has no live datetime1 field — rewrite is a no-op');
+        }
+        $md = "% Cover Title\n% Subtitle\n% 22. Mai 2026\n\n# Content\n\n- bullet";
+        $out = sys_get_temp_dir() . '/ppthelper_test_dt_live.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);
+        if (preg_match(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
             $slide1,
-            'title cover must NOT carry a sldNum stub'
-        );
-        $this->assertMatchesRegularExpression(
-            '#<p:ph\b[^/]*\btype="sldNum"#',
-            $slide2,
-            'content slide must carry an injected sldNum stub'
-        );
-        $this->assertMatchesRegularExpression(
-            '#<a:fld\b[^>]*type="slidenum"#',
-            $slide2,
-            'sldNum stub must contain a live slidenum field for PowerPoint to substitute'
-        );
+            $m
+        ) === 1) {
+            $this->assertMatchesRegularExpression(
+                '#<a:fld\b[^>]*type="datetime1"#',
+                $m[0],
+                'dt placeholder must be rewritten to a live datetime1 field'
+            );
+        } else {
+            $this->fail('slide 1 must have a dt placeholder');
+        }
     }
 
     public function test__subtitle_xfrm_stripped(): void
