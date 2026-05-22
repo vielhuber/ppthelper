@@ -160,9 +160,9 @@ class ppthelper
         // with marL="1270000" + <a:buNone/>. When a slide's body is entirely
         // such paragraphs, remap it to the skeleton's quote-typed layout
         // (e.g. "Zitat mit Beschriftung") for visual distinction.
-        $quote_layout = self::findQuoteLayout($template);
-        if ($quote_layout !== null) {
-            self::remapQuoteSlides($output, $quote_layout);
+        $quote_info = self::findQuoteLayout($template);
+        if ($quote_info !== null) {
+            self::remapQuoteSlides($output, $quote_info['name'], $quote_info['body_idx']);
         }
 
         // Pandoc emits each slide with only title/body/date placeholders.
@@ -665,13 +665,20 @@ class ppthelper
     }
 
     /**
-     * Locate the skeleton's quote/Zitat layout by name. Unlike section-header
-     * (which is identifiable via `type="secHead"`), quote layouts use the
-     * generic `type="title"` and only differ by their cSld name. Match on
-     * substring "quote" or "zitat" (case-insensitive). Returns the layout
-     * basename or null if no such layout exists.
+     * Locate the skeleton's quote/Zitat layout by name and figure out which
+     * body-placeholder `idx` inside it carries the main quote text (vs. the
+     * smaller caption). Returns ['name' => 'slideLayoutN.xml', 'body_idx' =>
+     * '2'] or null when no such layout exists.
+     *
+     * Quote layouts use the generic `type="title"`, so we match by cSld name
+     * ("zitat" / "quote", case-insensitive). For the body-idx, we look at
+     * every `<p:ph type="body" idx="...">` inside the layout and pick the
+     * one with the largest `<a:ext cy="...">`. Pandoc emits its content as
+     * `<p:ph idx="1" />` — that idx usually doesn't exist in a quote layout,
+     * so the slide's content placeholder needs to be re-anchored to the
+     * actual body-idx the layout provides.
      */
-    private static function findQuoteLayout(string $template_path): ?string
+    private static function findQuoteLayout(string $template_path): ?array
     {
         $zip = new ZipArchive();
         if ($zip->open($template_path) !== true) {
@@ -690,9 +697,31 @@ class ppthelper
                 if (preg_match('#<p:cSld\b[^>]*\bname="([^"]+)"#', $xml, $nm) !== 1) {
                     continue;
                 }
-                if (preg_match('#(zitat|quote)#i', $nm[1]) === 1) {
-                    return basename($name);
+                if (preg_match('#(zitat|quote)#i', $nm[1]) !== 1) {
+                    continue;
                 }
+                // find body placeholders and pick the one with the largest cy
+                $best_idx = null;
+                $best_cy = -1;
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="body"[^/]*\bidx="(\d+)"#', $sp, $im) !== 1
+                            && preg_match('#<p:ph\b[^/]*\bidx="(\d+)"[^/]*\btype="body"#', $sp, $im) !== 1
+                        ) {
+                            continue;
+                        }
+                        $idx = $im[1];
+                        if (preg_match('#<a:ext\s+cx="\d+"\s+cy="(\d+)"#', $sp, $em) !== 1) {
+                            continue;
+                        }
+                        $cy = (int) $em[1];
+                        if ($cy > $best_cy) {
+                            $best_cy = $cy;
+                            $best_idx = $idx;
+                        }
+                    }
+                }
+                return ['name' => basename($name), 'body_idx' => $best_idx];
             }
         } finally {
             $zip->close();
@@ -705,8 +734,14 @@ class ppthelper
      * paragraphs (marL="1270000" + <a:buNone/>) gets remapped to the
      * skeleton's quote layout. Skips slides with tables, pictures, or any
      * non-blockquote body paragraph so we don't hijack normal content.
+     *
+     * Additionally re-anchors the slide's content placeholder from Pandoc's
+     * default `idx="1"` to whatever body-idx the quote layout actually
+     * exposes (typically idx="2") — otherwise PowerPoint can't bind the
+     * paragraph to a layout placeholder and renders it at a stray default
+     * position, making the slide look broken/shifted.
      */
-    private static function remapQuoteSlides(string $output_path, string $quote_layout_name): void
+    private static function remapQuoteSlides(string $output_path, string $quote_layout_name, ?string $body_idx): void
     {
         $zip = new ZipArchive();
         if ($zip->open($output_path) !== true) {
@@ -779,6 +814,39 @@ class ppthelper
                 if (is_string($new_rels) && $new_rels !== $rels_xml) {
                     $zip->deleteName($rels_name);
                     $zip->addFromString($rels_name, $new_rels);
+                }
+                // Re-anchor the content placeholder so it binds to the quote
+                // layout's actual body-idx instead of Pandoc's default idx="1"
+                // (which usually doesn't exist in a quote layout). Without
+                // this PowerPoint renders the quote text at a stray default
+                // position outside the designed layout zone.
+                if ($body_idx !== null && $body_idx !== '1') {
+                    $patched_slide = preg_replace_callback(
+                        '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                        static function (array $m) use ($body_idx): string {
+                            $sp = $m[0];
+                            if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                                return $sp;
+                            }
+                            if (preg_match('#<p:ph\b[^/]*\bidx="1"\s*/>#', $sp) !== 1
+                                && preg_match('#<p:ph\b[^/]*\bidx="1"\s*>#', $sp) !== 1
+                            ) {
+                                return $sp;
+                            }
+                            $rewritten = preg_replace(
+                                '#<p:ph\b([^/]*?)\bidx="1"([^/]*?)/?>#',
+                                '<p:ph type="body"$1idx="' . $body_idx . '"$2/>',
+                                $sp,
+                                1
+                            );
+                            return is_string($rewritten) ? $rewritten : $sp;
+                        },
+                        $slide_xml
+                    );
+                    if (is_string($patched_slide) && $patched_slide !== $slide_xml) {
+                        $zip->deleteName($name);
+                        $zip->addFromString($name, $patched_slide);
+                    }
                 }
             }
         } finally {

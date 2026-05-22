@@ -531,11 +531,13 @@ class Test extends \PHPUnit\Framework\TestCase
     {
         // Pandoc renders `> text` blockquotes with marL="1270000" + <a:buNone/>.
         // When the entire body of a slide is such paragraphs, ppthelper remaps
-        // the layout to the skeleton's quote-named layout.
+        // the layout to the skeleton's quote-named layout AND re-anchors the
+        // content placeholder to the layout's body-idx (typically 2, not 1).
         $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
         $z = new ZipArchive();
         $z->open($skeleton);
         $quote_layout = null;
+        $quote_body_idx = null;
         for ($i = 0; $i < $z->numFiles; $i++) {
             $n = $z->getNameIndex($i);
             if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
@@ -548,6 +550,18 @@ class Test extends \PHPUnit\Framework\TestCase
                 preg_match('#(zitat|quote)#i', $nm[1]) === 1
             ) {
                 $quote_layout = basename($n);
+                $best_cy = -1;
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $x, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="body"[^/]*\bidx="(\d+)"#', $sp, $im) === 1
+                            && preg_match('#<a:ext\s+cx="\d+"\s+cy="(\d+)"#', $sp, $em) === 1
+                            && (int) $em[1] > $best_cy
+                        ) {
+                            $best_cy = (int) $em[1];
+                            $quote_body_idx = $im[1];
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -562,12 +576,25 @@ class Test extends \PHPUnit\Framework\TestCase
         $z = new ZipArchive();
         $z->open($out);
         $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
+        $slide = $z->getFromName('ppt/slides/slide1.xml');
         $z->close();
         $this->assertStringContainsString(
             $quote_layout,
             $rels,
             'blockquote-only slide must be remapped to the skeleton quote layout'
         );
+        if ($quote_body_idx !== null && $quote_body_idx !== '1') {
+            $this->assertMatchesRegularExpression(
+                '#<p:ph\b[^/]*\bidx="' . preg_quote($quote_body_idx, '#') . '"#',
+                $slide,
+                'quote slide content placeholder must be re-anchored to layout body-idx (= ' . $quote_body_idx . ')'
+            );
+            $this->assertDoesNotMatchRegularExpression(
+                '#<p:ph\b\s+idx="1"\s*/?>#',
+                $slide,
+                'pandoc default idx="1" must be replaced when layout uses a different body-idx'
+            );
+        }
     }
 
     public function test__non_quote_slide_keeps_default_layout(): void
