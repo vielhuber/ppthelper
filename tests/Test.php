@@ -527,6 +527,35 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__sldnum_stub_injected_on_content_slides(): void
+    {
+        // Pandoc never writes sldNum/ftr. The post-process must inject a
+        // <p:ph type="sldNum"> stub with a live slidenum field so PowerPoint
+        // can substitute the actual number instead of the layout's "‹Nr.›"
+        // default text. Title cover must be exempt.
+        $md = "% Cover\n% Author\n% 22. Mai 2026\n\n# Content slide\n\n- bullet";
+        $out = sys_get_temp_dir() . '/ppthelper_test_sldnum.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);  // title cover
+        $slide2 = self::loadSlideXml($out, 2);  // content slide
+        $this->assertDoesNotMatchRegularExpression(
+            '#<p:ph\b[^/]*\btype="sldNum"#',
+            $slide1,
+            'title cover must NOT carry a sldNum stub'
+        );
+        $this->assertMatchesRegularExpression(
+            '#<p:ph\b[^/]*\btype="sldNum"#',
+            $slide2,
+            'content slide must carry an injected sldNum stub'
+        );
+        $this->assertMatchesRegularExpression(
+            '#<a:fld\b[^>]*type="slidenum"#',
+            $slide2,
+            'sldNum stub must contain a live slidenum field for PowerPoint to substitute'
+        );
+    }
+
     public function test__subtitle_xfrm_stripped(): void
     {
         // The title-slide's subtitle placeholder used to overlap the centered

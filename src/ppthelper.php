@@ -156,6 +156,14 @@ class ppthelper
             self::remapSectionHeaderSlides($output, $sec_layout);
         }
 
+        // Pandoc emits each slide with only title/body/date placeholders.
+        // Skeleton layouts often also contain sldNum and ftr placeholders —
+        // when those don't exist in the slide itself, PowerPoint falls back
+        // to showing the layout's literal default text ("‹Nr.›") instead of
+        // evaluating the <a:fld type="slidenum"> field at render time. Inject
+        // minimal stubs so the field becomes live.
+        self::injectMissingSystemPlaceholders($output);
+
         self::validateOutput($output);
 
         // Post-process: transitions + animations.
@@ -636,6 +644,118 @@ class ppthelper
                 if (is_string($new_slide_xml) && $new_slide_xml !== $slide_xml) {
                     $zip->deleteName($name);
                     $zip->addFromString($name, $new_slide_xml);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Walk every slide and inject minimal <p:sp> stubs for sldNum and ftr
+     * placeholders whose corresponding layout defines one. Pandoc never
+     * writes these, which makes PowerPoint render the layout's literal
+     * "‹Nr.›" instead of the live slide-number field. A stub with an empty
+     * <p:spPr/> (no xfrm) inherits the layout's geometry, and the <a:fld
+     * type="slidenum"> inside it triggers live field substitution.
+     *
+     * Skips the title slide (any slide containing a ctrTitle placeholder) so
+     * presentations keep the convention of no number/footer on the cover.
+     */
+    private static function injectMissingSystemPlaceholders(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for placeholder injection: ' . $output_path);
+        }
+        try {
+            // pre-compute which layouts define sldNum / ftr placeholders
+            $layout_has = [];
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $layout_has[basename($name)] = [
+                    'sldNum' => preg_match('#<p:ph\b[^/]*\btype="sldNum"#', $xml) === 1,
+                    'ftr' => preg_match('#<p:ph\b[^/]*\btype="ftr"#', $xml) === 1,
+                ];
+            }
+            // visit each slide
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide(\d+)\.xml$#', $name, $sm) !== 1) {
+                    continue;
+                }
+                $slide_xml = $zip->getFromIndex($i);
+                if (!is_string($slide_xml)) {
+                    continue;
+                }
+                // skip the title cover — no slide number / footer there
+                if (preg_match('#<p:ph\b[^/]*\btype="ctrTitle"#', $slide_xml) === 1) {
+                    continue;
+                }
+                // resolve which layout this slide uses
+                $rels_xml = $zip->getFromName('ppt/slides/_rels/slide' . $sm[1] . '.xml.rels');
+                if (!is_string($rels_xml)) {
+                    continue;
+                }
+                if (preg_match('#Target="\.\./slideLayouts/(slideLayout\d+\.xml)"#', $rels_xml, $lm) !== 1) {
+                    continue;
+                }
+                $layout_basename = $lm[1];
+                $caps = $layout_has[$layout_basename] ?? null;
+                if ($caps === null) {
+                    continue;
+                }
+                $additions = '';
+                if ($caps['sldNum'] && preg_match('#<p:ph\b[^/]*\btype="sldNum"#', $slide_xml) !== 1) {
+                    $additions .= '<p:sp>'
+                        . '<p:nvSpPr>'
+                        . '<p:cNvPr id="1001" name="Slide Number Placeholder"/>'
+                        . '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>'
+                        . '<p:nvPr><p:ph type="sldNum" sz="quarter" idx="12"/></p:nvPr>'
+                        . '</p:nvSpPr>'
+                        . '<p:spPr/>'
+                        . '<p:txBody>'
+                        . '<a:bodyPr/>'
+                        . '<a:lstStyle/>'
+                        . '<a:p>'
+                        . '<a:fld id="{C5EF2332-01BF-834F-8236-50238282D533}" type="slidenum">'
+                        . '<a:rPr lang="de-DE"/>'
+                        . '<a:t>1</a:t>'
+                        . '</a:fld>'
+                        . '</a:p>'
+                        . '</p:txBody>'
+                        . '</p:sp>';
+                }
+                if ($caps['ftr'] && preg_match('#<p:ph\b[^/]*\btype="ftr"#', $slide_xml) !== 1) {
+                    $additions .= '<p:sp>'
+                        . '<p:nvSpPr>'
+                        . '<p:cNvPr id="1002" name="Footer Placeholder"/>'
+                        . '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>'
+                        . '<p:nvPr><p:ph type="ftr" sz="quarter" idx="11"/></p:nvPr>'
+                        . '</p:nvSpPr>'
+                        . '<p:spPr/>'
+                        . '<p:txBody>'
+                        . '<a:bodyPr/>'
+                        . '<a:lstStyle/>'
+                        . '<a:p><a:endParaRPr lang="de-DE"/></a:p>'
+                        . '</p:txBody>'
+                        . '</p:sp>';
+                }
+                if ($additions === '') {
+                    continue;
+                }
+                // inject right before </p:spTree>
+                $new_xml = preg_replace('#</p:spTree>#', $additions . '</p:spTree>', $slide_xml, 1);
+                if (is_string($new_xml) && $new_xml !== $slide_xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $new_xml);
                 }
             }
         } finally {
