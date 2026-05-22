@@ -652,6 +652,50 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__quote_paragraph_marl_stripped(): void
+    {
+        // Pandoc emits blockquote paragraphs with marL="1270000". The quote
+        // layout's body is centered, so a non-zero marL pushes short lines
+        // (typically the attribution) visibly off-center to the right.
+        // remapQuoteSlides must drop the marL after detection so PowerPoint
+        // centers over the full body width.
+        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $has_quote_layout = false;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (
+                is_string($x) &&
+                preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $x) === 1
+            ) {
+                $has_quote_layout = true;
+                break;
+            }
+        }
+        $z->close();
+        if (!$has_quote_layout) {
+            $this->markTestSkipped('skeleton has no quote/zitat layout — strip is a no-op');
+        }
+        $md = "# Quote slide\n\n> Lorem ipsum dolor sit amet.\n>\n> — Author";
+        $out = sys_get_temp_dir() . '/ppthelper_test_quote_marl.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        $slide = self::loadSlideXml($out, 1);
+        $this->assertDoesNotMatchRegularExpression(
+            '#<a:pPr\b[^/]*\bmarL="1270000"#',
+            $slide,
+            'quote slide must not retain pandoc blockquote marL after remap'
+        );
+        // text must still be present
+        $this->assertStringContainsString('Lorem ipsum', $slide);
+        $this->assertStringContainsString('— Author', $slide);
+    }
+
     public function test__image_alt_caption_is_stripped(): void
     {
         // Pandoc renders `![governance](path)` with the alt-text as a free

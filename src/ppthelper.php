@@ -830,6 +830,22 @@ class ppthelper
                     $zip->deleteName($rels_name);
                     $zip->addFromString($rels_name, $new_rels);
                 }
+                // Pandoc sets marL="1270000" on every blockquote paragraph
+                // (its standard ~1.27" left indent). The quote layout's body
+                // is centered via algn="ctr" though, so a residual marL
+                // shrinks the centering field on the left and visibly pushes
+                // short lines (typically the "— author" attribution) to the
+                // right. Detection has already happened — drop the marL so
+                // PowerPoint centers over the full box width.
+                $stripped_marl = preg_replace(
+                    '#(<a:pPr\b[^/]*?)\smarL="1270000"#',
+                    '$1',
+                    $slide_xml
+                );
+                if (is_string($stripped_marl) && $stripped_marl !== $slide_xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $stripped_marl);
+                }
                 // re-anchoring the content placeholder onto the quote layout's
                 // actual body-idx happens later in normalizeBodyPlaceholderIndices
             }
