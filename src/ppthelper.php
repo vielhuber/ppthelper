@@ -162,8 +162,17 @@ class ppthelper
         // (e.g. "Zitat mit Beschriftung") for visual distinction.
         $quote_info = self::findQuoteLayout($template);
         if ($quote_info !== null) {
-            self::remapQuoteSlides($output, $quote_info['name'], $quote_info['body_idx']);
+            self::remapQuoteSlides($output, $quote_info['name']);
         }
+
+        // Pandoc emits content placeholders hard-coded as <p:ph idx="1"> (and
+        // "2" for two-column). Custom skeletons frequently use other indices
+        // (e.g. idx="13" / "14") — without a normaliser PowerPoint can't bind
+        // the slide's body to a layout placeholder and renders the text at a
+        // default position outside the designed layout zone (or invisibly).
+        // Run AFTER the section-header / quote remaps so each slide's body
+        // gets matched against the final layout it actually points to.
+        self::normalizeBodyPlaceholderIndices($output);
 
         // Pandoc emits each slide with only title/body/date placeholders.
         // Skeleton layouts often also contain sldNum and ftr placeholders —
@@ -735,13 +744,10 @@ class ppthelper
      * skeleton's quote layout. Skips slides with tables, pictures, or any
      * non-blockquote body paragraph so we don't hijack normal content.
      *
-     * Additionally re-anchors the slide's content placeholder from Pandoc's
-     * default `idx="1"` to whatever body-idx the quote layout actually
-     * exposes (typically idx="2") — otherwise PowerPoint can't bind the
-     * paragraph to a layout placeholder and renders it at a stray default
-     * position, making the slide look broken/shifted.
+     * The body-idx is re-anchored generically by normalizeBodyPlaceholderIndices
+     * later in the pipeline, so this routine only patches the layout relationship.
      */
-    private static function remapQuoteSlides(string $output_path, string $quote_layout_name, ?string $body_idx): void
+    private static function remapQuoteSlides(string $output_path, string $quote_layout_name): void
     {
         $zip = new ZipArchive();
         if ($zip->open($output_path) !== true) {
@@ -815,38 +821,169 @@ class ppthelper
                     $zip->deleteName($rels_name);
                     $zip->addFromString($rels_name, $new_rels);
                 }
-                // Re-anchor the content placeholder so it binds to the quote
-                // layout's actual body-idx instead of Pandoc's default idx="1"
-                // (which usually doesn't exist in a quote layout). Without
-                // this PowerPoint renders the quote text at a stray default
-                // position outside the designed layout zone.
-                if ($body_idx !== null && $body_idx !== '1') {
-                    $patched_slide = preg_replace_callback(
-                        '#<p:sp\b[^>]*>.*?</p:sp>#s',
-                        static function (array $m) use ($body_idx): string {
-                            $sp = $m[0];
-                            if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
-                                return $sp;
-                            }
-                            if (preg_match('#<p:ph\b[^/]*\bidx="1"\s*/>#', $sp) !== 1
-                                && preg_match('#<p:ph\b[^/]*\bidx="1"\s*>#', $sp) !== 1
-                            ) {
-                                return $sp;
-                            }
-                            $rewritten = preg_replace(
-                                '#<p:ph\b([^/]*?)\bidx="1"([^/]*?)/?>#',
-                                '<p:ph type="body"$1idx="' . $body_idx . '"$2/>',
-                                $sp,
-                                1
-                            );
-                            return is_string($rewritten) ? $rewritten : $sp;
-                        },
-                        $slide_xml
-                    );
-                    if (is_string($patched_slide) && $patched_slide !== $slide_xml) {
-                        $zip->deleteName($name);
-                        $zip->addFromString($name, $patched_slide);
+                // re-anchoring the content placeholder onto the quote layout's
+                // actual body-idx happens later in normalizeBodyPlaceholderIndices
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Re-anchor each slide's body placeholders onto the indices the layout
+     * actually provides. Pandoc hard-codes `<p:ph idx="1">` (and "2" for the
+     * second column in two-content layouts) — custom skeletons frequently use
+     * different indices (e.g. 13/14). When the slide's idx doesn't match any
+     * idx in its layout, PowerPoint can't bind the placeholder to layout
+     * geometry and renders the text at a default position or invisibly.
+     *
+     * Mapping heuristic:
+     *  - 1 body in slide → map onto the layout's body with the largest cy
+     *    (the "main" content area; for a quote layout this skips the small
+     *    caption placeholder).
+     *  - N bodies in slide → map by reading order (x asc, then y asc) onto
+     *    the layout's first N body placeholders in the same order. Two-column
+     *    layouts have left=lower-x, right=higher-x, so Pandoc's idx="1"
+     *    naturally maps to the left and idx="2" to the right.
+     */
+    private static function normalizeBodyPlaceholderIndices(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for body-idx normalisation: ' . $output_path);
+        }
+        try {
+            // pre-compute layout body placeholders with positions / sizes
+            $layout_bodies = [];
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slideLayouts/(slideLayout\d+\.xml)$#', $name, $lm) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $bodies = [];
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) !== 1) {
+                            continue;
+                        }
+                        $idx = $im[1];
+                        $px = $py = $cx = $cy = 0;
+                        if (preg_match('#<a:off x="(\d+)" y="(\d+)"#', $sp, $om) === 1) {
+                            $px = (int) $om[1];
+                            $py = (int) $om[2];
+                        }
+                        if (preg_match('#<a:ext cx="(\d+)" cy="(\d+)"#', $sp, $em) === 1) {
+                            $cx = (int) $em[1];
+                            $cy = (int) $em[2];
+                        }
+                        $bodies[] = ['idx' => $idx, 'x' => $px, 'y' => $py, 'cx' => $cx, 'cy' => $cy];
                     }
+                }
+                $layout_bodies[$lm[1]] = $bodies;
+            }
+
+            // visit each slide
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide(\d+)\.xml$#', $name, $sm) !== 1) {
+                    continue;
+                }
+                $slide_xml = $zip->getFromIndex($i);
+                if (!is_string($slide_xml)) {
+                    continue;
+                }
+                $rels_xml = $zip->getFromName('ppt/slides/_rels/slide' . $sm[1] . '.xml.rels');
+                if (!is_string($rels_xml)) {
+                    continue;
+                }
+                if (preg_match('#Target="\.\./slideLayouts/(slideLayout\d+\.xml)"#', $rels_xml, $lm) !== 1) {
+                    continue;
+                }
+                $layout_b = $layout_bodies[$lm[1]] ?? null;
+                if ($layout_b === null || $layout_b === []) {
+                    continue;
+                }
+
+                // collect slide body placeholders in document order
+                $slide_bodies = [];
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $slide_xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) === 1) {
+                            $slide_bodies[] = $im[1];
+                        }
+                    }
+                }
+                if ($slide_bodies === []) {
+                    continue;
+                }
+
+                // build idx → idx mapping
+                $mapping = [];
+                if (count($slide_bodies) === 1) {
+                    // single body — map onto the layout's largest-cy body
+                    $sorted = $layout_b;
+                    usort($sorted, static fn($a, $b) => $b['cy'] <=> $a['cy']);
+                    $target = $sorted[0]['idx'];
+                    if ($slide_bodies[0] !== $target) {
+                        $mapping[$slide_bodies[0]] = $target;
+                    }
+                } else {
+                    // multiple bodies — map by reading order (x asc, y asc)
+                    $sorted = $layout_b;
+                    usort($sorted, static fn($a, $b) => $a['x'] <=> $b['x'] ?: $a['y'] <=> $b['y']);
+                    foreach ($slide_bodies as $i_b => $orig) {
+                        if (!isset($sorted[$i_b])) {
+                            break;
+                        }
+                        $target = $sorted[$i_b]['idx'];
+                        if ($orig !== $target) {
+                            $mapping[$orig] = $target;
+                        }
+                    }
+                }
+                if ($mapping === []) {
+                    continue;
+                }
+
+                // apply mapping — only touch <p:ph> inside non-system <p:sp>
+                $new_xml = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m) use ($mapping): string {
+                        $sp = $m[0];
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            return $sp;
+                        }
+                        if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) !== 1) {
+                            return $sp;
+                        }
+                        $orig = $im[1];
+                        if (!isset($mapping[$orig])) {
+                            return $sp;
+                        }
+                        $new_idx = $mapping[$orig];
+                        $patched = preg_replace(
+                            '#(<p:ph\b[^/]*?)\bidx="' . preg_quote($orig, '#') . '"#',
+                            '$1idx="' . $new_idx . '"',
+                            $sp,
+                            1
+                        );
+                        return is_string($patched) ? $patched : $sp;
+                    },
+                    $slide_xml
+                );
+                if (is_string($new_xml) && $new_xml !== $slide_xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $new_xml);
                 }
             }
         } finally {

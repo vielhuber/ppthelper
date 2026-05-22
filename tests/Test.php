@@ -597,6 +597,116 @@ class Test extends \PHPUnit\Framework\TestCase
         }
     }
 
+    public function test__body_idx_normalised_to_match_layout(): void
+    {
+        // Pandoc emits content as <p:ph idx="1">. The skeleton's L2 may use a
+        // different idx (e.g. 13). Without normalisation PowerPoint can't bind
+        // the placeholder and the body renders at a stray default position.
+        // After post-process the slide's body-idx must exist in its layout.
+        $md = "# Content\n- bullet";
+        $out = sys_get_temp_dir() . '/ppthelper_test_idx_norm.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+
+        $z = new ZipArchive();
+        $z->open($out);
+        $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
+        preg_match('#slideLayout(\d+)#', $rels, $lm);
+        $layout = $z->getFromName('ppt/slideLayouts/slideLayout' . $lm[1] . '.xml');
+        $slide = $z->getFromName('ppt/slides/slide1.xml');
+        $z->close();
+
+        // collect body-idx from layout (non-system placeholders)
+        $layout_body_idxs = [];
+        if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $layout, $sps) !== false) {
+            foreach ($sps[0] as $sp) {
+                if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                    continue;
+                }
+                if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) === 1) {
+                    $layout_body_idxs[] = $im[1];
+                }
+            }
+        }
+        if ($layout_body_idxs === []) {
+            $this->markTestSkipped('layout has no body placeholder — no normalisation possible');
+        }
+        // slide's body-idx must be one of the layout's body-idx
+        $slide_body_idx = null;
+        if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $slide, $sps) !== false) {
+            foreach ($sps[0] as $sp) {
+                if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                    continue;
+                }
+                if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) === 1) {
+                    $slide_body_idx = $im[1];
+                    break;
+                }
+            }
+        }
+        $this->assertNotNull($slide_body_idx, 'slide must have a body placeholder');
+        $this->assertContains(
+            $slide_body_idx,
+            $layout_body_idxs,
+            'slide body-idx (' . $slide_body_idx . ') must exist in layout body-idx list (' . implode(',', $layout_body_idxs) . ')'
+        );
+    }
+
+    public function test__two_column_idx_mapped_in_reading_order(): void
+    {
+        // Pandoc emits left=idx="1", right=idx="2" for two-column slides.
+        // After normalisation both must point to actual layout body-idx,
+        // ordered by x-position (left layout-body for left slide-body).
+        $md = "# Two cols\n\n:::: {.columns}\n::: {.column}\n- LEFT_BULLET\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::";
+        $out = sys_get_temp_dir() . '/ppthelper_test_idx_twocol.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+
+        $z = new ZipArchive();
+        $z->open($out);
+        $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
+        preg_match('#slideLayout(\d+)#', $rels, $lm);
+        $layout = $z->getFromName('ppt/slideLayouts/slideLayout' . $lm[1] . '.xml');
+        $slide = $z->getFromName('ppt/slides/slide1.xml');
+        $z->close();
+
+        // collect layout body-idx sorted by x
+        $layout_bodies = [];
+        if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $layout, $sps) !== false) {
+            foreach ($sps[0] as $sp) {
+                if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                    continue;
+                }
+                if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) !== 1) {
+                    continue;
+                }
+                $x = 0;
+                if (preg_match('#<a:off x="(\d+)"#', $sp, $om) === 1) {
+                    $x = (int) $om[1];
+                }
+                $layout_bodies[] = ['idx' => $im[1], 'x' => $x];
+            }
+        }
+        if (count($layout_bodies) < 2) {
+            $this->markTestSkipped('layout has fewer than 2 body placeholders');
+        }
+        usort($layout_bodies, static fn($a, $b) => $a['x'] <=> $b['x']);
+        $expected_left = $layout_bodies[0]['idx'];
+        $expected_right = $layout_bodies[1]['idx'];
+
+        // verify slide content matches expected placement
+        $this->assertMatchesRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\bidx="' . preg_quote($expected_left, '#') . '"(?:(?!</p:sp>).)*?LEFT_BULLET#s',
+            $slide,
+            'LEFT_BULLET must sit in the layout-left body placeholder (idx=' . $expected_left . ')'
+        );
+        $this->assertMatchesRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\bidx="' . preg_quote($expected_right, '#') . '"(?:(?!</p:sp>).)*?RIGHT_BULLET#s',
+            $slide,
+            'RIGHT_BULLET must sit in the layout-right body placeholder (idx=' . $expected_right . ')'
+        );
+    }
+
     public function test__non_quote_slide_keeps_default_layout(): void
     {
         // Plain content slide (bullets, not blockquote) must NOT be remapped
