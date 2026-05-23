@@ -163,6 +163,12 @@ class ppthelper
         $quote_info = self::findQuoteLayout($template);
         if ($quote_info !== null) {
             self::remapQuoteSlides($output, $quote_info['name']);
+        } else {
+            // Skeleton has no quote/zitat layout — give blockquote-only
+            // slides an inline italic/larger-text style so they still read
+            // distinctly from regular content slides instead of looking like
+            // a normal Title+Bullets slide.
+            self::styleQuoteSlidesInline($output);
         }
 
         // Pandoc emits content placeholders hard-coded as <p:ph idx="1"> (and
@@ -511,8 +517,27 @@ class ppthelper
                         if (preg_match('#<p:ph\b[^/]*\btype="(?:ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) !== 1) {
                             return $sp;
                         }
+                        // strip Pandoc's <a:xfrm> so the placeholder picks up
+                        // the layout default geometry
                         $stripped = preg_replace('#<a:xfrm>.*?</a:xfrm>#s', '', $sp, 1);
-                        return is_string($stripped) ? $stripped : $sp;
+                        if (!is_string($stripped)) {
+                            $stripped = $sp;
+                        }
+                        // Pandoc emits the subtitle paragraph with two leading
+                        // <a:br/> tags as cosmetic spacer to the title. On
+                        // compact slide formats (subtitle box ≤ ~0.8" high)
+                        // that pushes the actual text out of the bottom of
+                        // the box. Drop those leading <a:br/> — the layout's
+                        // own padding/anchor handles spacing.
+                        if (preg_match('#<p:ph\b[^/]*\btype="subTitle"#', $stripped) === 1) {
+                            $stripped = preg_replace(
+                                '#(<a:p\b[^>]*>(?:<a:pPr\b[^/]*/?>(?:</a:pPr>)?)?)(?:<a:br\s*/>){1,}#',
+                                '$1',
+                                $stripped,
+                                1
+                            ) ?? $stripped;
+                        }
+                        return $stripped;
                     },
                     $xml
                 );
@@ -848,6 +873,112 @@ class ppthelper
                 }
                 // re-anchoring the content placeholder onto the quote layout's
                 // actual body-idx happens later in normalizeBodyPlaceholderIndices
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Fallback when the skeleton has no dedicated quote/zitat layout: detect
+     * blockquote-only slides (same heuristic as remapQuoteSlides) and apply
+     * an inline italic + larger-font style to the body runs so the slide at
+     * least reads as a quote instead of looking like a normal Title+Bullets
+     * slide. Also strips Pandoc's marL="1270000" so the body centers cleanly.
+     */
+    private static function styleQuoteSlidesInline(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for inline quote styling: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $slide_xml = $zip->getFromIndex($i);
+                if (!is_string($slide_xml)) {
+                    continue;
+                }
+                if (str_contains($slide_xml, '<p:graphicFrame') || str_contains($slide_xml, '<p:pic')) {
+                    continue;
+                }
+                if (preg_match('#<p:ph\b[^/]*\btype="ctrTitle"#', $slide_xml) === 1) {
+                    continue;
+                }
+                $is_quote = false;
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $slide_xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match_all('#<a:p\b.*?</a:p>#s', $sp, $paras) === false) {
+                            continue;
+                        }
+                        $any_para = false;
+                        $all_quote = true;
+                        foreach ($paras[0] as $para) {
+                            if (preg_match('#<a:t>\s*\S#', $para) !== 1) {
+                                continue;
+                            }
+                            $any_para = true;
+                            if (preg_match('#<a:pPr\b[^>]*\bmarL="1270000"#', $para) !== 1) {
+                                $all_quote = false;
+                                break;
+                            }
+                        }
+                        if ($any_para && $all_quote) {
+                            $is_quote = true;
+                            break;
+                        }
+                    }
+                }
+                if (!$is_quote) {
+                    continue;
+                }
+                // strip marL (cosmetic — body now uses full box width)
+                $patched = preg_replace(
+                    '#(<a:pPr\b[^/]*?)\smarL="1270000"#',
+                    '$1',
+                    $slide_xml
+                );
+                if (!is_string($patched)) {
+                    $patched = $slide_xml;
+                }
+                // patch non-system body runs: add italic + larger font.
+                // - if <a:rPr/> empty or self-closing: replace with <a:rPr i="1" sz="2400"/>
+                // - if <a:rPr ...> already has attrs: merge i="1" + sz="2400" (don't override existing sz)
+                $patched = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m): string {
+                        $sp = $m[0];
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            return $sp;
+                        }
+                        return preg_replace_callback(
+                            '#<a:rPr\b([^/>]*)(/?)>#',
+                            static function (array $rm): string {
+                                $attrs = $rm[1];
+                                $self_close = $rm[2];
+                                if (!preg_match('#\bi="#', $attrs)) {
+                                    $attrs .= ' i="1"';
+                                }
+                                if (!preg_match('#\bsz="#', $attrs)) {
+                                    $attrs .= ' sz="2400"';
+                                }
+                                return '<a:rPr' . $attrs . $self_close . '>';
+                            },
+                            $sp
+                        ) ?? $sp;
+                    },
+                    $patched
+                ) ?? $patched;
+                if ($patched !== $slide_xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $patched);
+                }
             }
         } finally {
             $zip->close();
