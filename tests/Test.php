@@ -1303,6 +1303,16 @@ class Test extends \PHPUnit\Framework\TestCase
      */
     public function test__render_all_skeletons_for_manual_review(): void
     {
+        // This is a fixture-generator for human review, not a behavior check.
+        // It renders one ~21-slide sample deck through every skeleton in
+        // `tests/skeleton_input/` and dumps the result to `skeleton_output/`
+        // so a reviewer can visually compare looks across templates.
+        // In CI we skip it — 32 sequential pandoc runs + post-process passes
+        // exhaust the macOS-runner's memory budget (SIGKILL mid-suite), and
+        // CI runners can't review .pptx files anyway.
+        if (getenv('CI') === 'true' || ($_SERVER['CI'] ?? '') === 'true' || getenv('GITHUB_ACTIONS') === 'true') {
+            $this->markTestSkipped('skeleton-batch render is a local visual-review fixture, skipped on CI');
+        }
         $input_dir = dirname(__DIR__) . '/tests/skeleton_input';
         $output_dir = dirname(__DIR__) . '/tests/skeleton_output';
         if (!is_dir($input_dir)) {
