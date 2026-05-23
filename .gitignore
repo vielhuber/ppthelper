@@ -4,3 +4,5 @@
 /composer.lock
 /src/.env
 /.phpunit.cache
+# Office lock-files (~$skeleton01.pptx is created while a deck is open in PPT)
+~$*

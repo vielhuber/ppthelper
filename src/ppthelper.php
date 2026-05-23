@@ -189,6 +189,15 @@ class ppthelper
         // <p:pic> (still preserved for accessibility).
         self::stripFreeTextBoxes($output);
 
+        // Pandoc gives every <p:pic> a hard-coded position (roughly the
+        // left half of a 10"-slide) regardless of which layout the slide
+        // sits in. On layouts where the body-column doesn't match that
+        // hard-coded geometry — narrower or shifted — the picture spills
+        // into the neighbouring column and the text body collides with it.
+        // Refit every picture into the layout body-column it logically
+        // belongs to (closest column center, aspect-ratio preserved).
+        self::fitPicturesToLayoutColumns($output);
+
         // Pandoc emits each slide with only title/body/date placeholders.
         // Skeleton layouts often also contain sldNum and ftr placeholders —
         // when those don't exist in the slide itself, PowerPoint falls back
@@ -986,6 +995,194 @@ class ppthelper
     }
 
     /**
+     * Re-fit every <p:pic> into the layout body-column it logically belongs
+     * to. Pandoc emits pictures with a one-size-fits-all geometry (~left half
+     * of a 10" slide) regardless of the layout's actual column dimensions.
+     * On layouts whose body-column is narrower or differently positioned the
+     * picture spills into the neighbouring column, colliding with text.
+     *
+     * Algorithm (layout-agnostic):
+     *   - Look up the slide's layout, collect every non-system body
+     *     placeholder's (x, y, cx, cy).
+     *   - For each <p:pic> in the slide: pick the layout column whose center
+     *     is closest to the picture's center (= the column the picture
+     *     was meant for).
+     *   - Fit the picture into that column's box with aspect-ratio preserved
+     *     and the picture centered. Replace the picture's <a:xfrm>.
+     *
+     * No-op when the slide's layout has fewer than two non-system body
+     * placeholders (then there's no column structure to fit into and Pandoc's
+     * default geometry is fine).
+     */
+    private static function fitPicturesToLayoutColumns(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for picture-fit pass: ' . $output_path);
+        }
+        try {
+            // pre-compute layout body placeholders with positions
+            $layout_bodies = [];
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slideLayouts/(slideLayout\d+\.xml)$#', $name, $lm) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml)) {
+                    continue;
+                }
+                $bodies = [];
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $xml, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match('#<p:ph\b#', $sp) !== 1) {
+                            continue;
+                        }
+                        if (preg_match('#<a:off\s+x="(\d+)"\s+y="(\d+)"#', $sp, $om) !== 1) {
+                            continue;
+                        }
+                        if (preg_match('#<a:ext\s+cx="(\d+)"\s+cy="(\d+)"#', $sp, $em) !== 1) {
+                            continue;
+                        }
+                        $bodies[] = [
+                            'x' => (int) $om[1],
+                            'y' => (int) $om[2],
+                            'cx' => (int) $em[1],
+                            'cy' => (int) $em[2],
+                        ];
+                    }
+                }
+                $layout_bodies[$lm[1]] = $bodies;
+            }
+
+            // visit each slide
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide(\d+)\.xml$#', $name, $sm) !== 1) {
+                    continue;
+                }
+                $slide_xml = $zip->getFromIndex($i);
+                if (!is_string($slide_xml)) {
+                    continue;
+                }
+                if (strpos($slide_xml, '<p:pic') === false) {
+                    continue;
+                }
+                $rels_xml = $zip->getFromName('ppt/slides/_rels/slide' . $sm[1] . '.xml.rels');
+                if (!is_string($rels_xml)) {
+                    continue;
+                }
+                if (preg_match('#Target="\.\./slideLayouts/(slideLayout\d+\.xml)"#', $rels_xml, $lm) !== 1) {
+                    continue;
+                }
+                $cols = $layout_bodies[$lm[1]] ?? [];
+                // only refit when the layout actually has a multi-column body
+                // structure (otherwise Pandoc's default geometry is fine and
+                // we'd be picking arbitrary placeholders to squeeze the pic into)
+                if (count($cols) < 2) {
+                    continue;
+                }
+                $new_xml = preg_replace_callback(
+                    '#<p:pic\b[^>]*>.*?</p:pic>#s',
+                    static function (array $m) use ($cols): string {
+                        $pic = $m[0];
+                        if (preg_match('#<a:off\s+x="(\d+)"\s+y="(\d+)"#', $pic, $om) !== 1) {
+                            return $pic;
+                        }
+                        if (preg_match('#<a:ext\s+cx="(\d+)"\s+cy="(\d+)"#', $pic, $em) !== 1) {
+                            return $pic;
+                        }
+                        $px = (int) $om[1];
+                        $py = (int) $om[2];
+                        $pcx = (int) $em[1];
+                        $pcy = (int) $em[2];
+                        if ($pcx <= 0 || $pcy <= 0) {
+                            return $pic;
+                        }
+                        // pick the layout column whose center is closest to the
+                        // picture's center (handles both x and y offsets, so a
+                        // picture in the right column doesn't accidentally fit
+                        // into the left)
+                        $pic_cx_center = $px + (int) ($pcx / 2);
+                        $pic_cy_center = $py + (int) ($pcy / 2);
+                        $best = null;
+                        $best_dist = PHP_INT_MAX;
+                        foreach ($cols as $c) {
+                            $cx_center = $c['x'] + (int) ($c['cx'] / 2);
+                            $cy_center = $c['y'] + (int) ($c['cy'] / 2);
+                            $dx = $pic_cx_center - $cx_center;
+                            $dy = $pic_cy_center - $cy_center;
+                            $d = $dx * $dx + $dy * $dy;
+                            if ($d < $best_dist) {
+                                $best_dist = $d;
+                                $best = $c;
+                            }
+                        }
+                        if ($best === null) {
+                            return $pic;
+                        }
+                        // Fit pic into column with aspect-ratio preserved, then
+                        // anchor it. One axis always fills the column 100 %
+                        // (no whitespace there), the other has leftover space.
+                        // Anchor strategy: flush on the full axis, centered
+                        // on the short axis — that's the only choice that
+                        // looks balanced for BOTH near-square columns (16:9
+                        // pics get ~40 % vertical whitespace) AND tall portrait
+                        // columns (16:9 pics get ~60 % vertical whitespace).
+                        // Pure top-left would leave a huge dead zone at the
+                        // bottom in portrait columns; pure center would float
+                        // untethered in landscape columns. Center-on-short-axis
+                        // is the universal fit.
+                        $orig_aspect = $pcx / $pcy;
+                        $col_aspect = $best['cx'] / $best['cy'];
+                        if ($orig_aspect >= $col_aspect) {
+                            // pic wider than column → cap to column width;
+                            // vertical whitespace remains → center vertically
+                            $new_cx = $best['cx'];
+                            $new_cy = (int) round($best['cx'] / $orig_aspect);
+                            $new_x = $best['x'];
+                            $new_y = $best['y'] + (int) (($best['cy'] - $new_cy) / 2);
+                        } else {
+                            // pic taller than column → cap to column height;
+                            // horizontal whitespace remains → center horizontally
+                            $new_cy = $best['cy'];
+                            $new_cx = (int) round($best['cy'] * $orig_aspect);
+                            $new_x = $best['x'] + (int) (($best['cx'] - $new_cx) / 2);
+                            $new_y = $best['y'];
+                        }
+                        $patched = preg_replace(
+                            '#<a:off\s+x="\d+"\s+y="\d+"\s*/>#',
+                            '<a:off x="' . $new_x . '" y="' . $new_y . '"/>',
+                            $pic,
+                            1
+                        );
+                        if (!is_string($patched)) {
+                            return $pic;
+                        }
+                        $patched = preg_replace(
+                            '#<a:ext\s+cx="\d+"\s+cy="\d+"\s*/>#',
+                            '<a:ext cx="' . $new_cx . '" cy="' . $new_cy . '"/>',
+                            $patched,
+                            1
+                        );
+                        return is_string($patched) ? $patched : $pic;
+                    },
+                    $slide_xml
+                );
+                if (is_string($new_xml) && $new_xml !== $slide_xml) {
+                    $zip->deleteName($name);
+                    $zip->addFromString($name, $new_xml);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
      * Remove every free <p:sp txBox="1"> shape that has no <p:ph> — these are
      * Pandoc's image-caption text boxes (the alt-text of `![alt](path)`).
      * They live as floating shapes directly under the picture; on compact
@@ -1279,9 +1476,28 @@ class ppthelper
                 if (!is_string($xml)) {
                     continue;
                 }
+                // Trigger dt-rewrite when the layout signals "this box is for
+                // a SHORT date" — three signals qualify:
+                //   1) layout already uses a live <a:fld type="datetime1">
+                //      (designer's explicit intent)
+                //   2) layout's dt box is rotated 90° (rot="5400000") — that
+                //      design is dimensioned for the compact "DD.MM.YYYY"
+                //      form, a long "22. Mai 2026" string clips out
+                //   3) the box is very narrow (cx < ~1.6") — also obviously
+                //      designed for the short form
                 $dt_is_live = false;
                 if (preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s', $xml, $dt_block) === 1) {
-                    $dt_is_live = preg_match('#<a:fld\b[^>]*\btype="datetime1"#', $dt_block[0]) === 1;
+                    if (preg_match('#<a:fld\b[^>]*\btype="datetime1"#', $dt_block[0]) === 1) {
+                        $dt_is_live = true;
+                    } elseif (preg_match('#<a:xfrm\b[^>]*\brot="5400000"#', $dt_block[0]) === 1) {
+                        $dt_is_live = true;
+                    } elseif (
+                        preg_match('#<a:ext\b[^>]*\bcx="(\d+)"#', $dt_block[0], $cxm) === 1
+                        && (int) $cxm[1] > 0
+                        && (int) $cxm[1] < 1500000
+                    ) {
+                        $dt_is_live = true;
+                    }
                 }
                 $ftr_has_payload = false;
                 if (preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="ftr"(?:(?!</p:sp>).)*?</p:sp>#s', $xml, $ftr_block) === 1) {

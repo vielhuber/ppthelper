@@ -5,6 +5,49 @@ use vielhuber\ppthelper\ppthelper;
 
 class Test extends \PHPUnit\Framework\TestCase
 {
+    /**
+     * Find the first skeleton in `tests/skeleton_input/` whose `slideLayout*.xml`
+     * collection satisfies the predicate. Returns the absolute path, or null
+     * if none match. Used by tests that need a feature the bundled
+     * `assets/skeleton.pptx` doesn't ship with (e.g. a quote-typed layout
+     * or a live <a:fld type="datetime1"> field on the title slide).
+     */
+    private static function findSkeletonWithFeature(callable $layoutMatches): ?string
+    {
+        $dir = dirname(__DIR__) . '/tests/skeleton_input';
+        if (!is_dir($dir)) {
+            return null;
+        }
+        $skeletons = array_values(array_filter(
+            glob($dir . '/*.pptx') ?: [],
+            static fn(string $p): bool => !str_starts_with(basename($p), '~$')
+        ));
+        sort($skeletons);
+        foreach ($skeletons as $sk) {
+            $z = new ZipArchive();
+            if ($z->open($sk) !== true) {
+                continue;
+            }
+            $hit = false;
+            for ($i = 0; $i < $z->numFiles; $i++) {
+                $n = $z->getNameIndex($i);
+                if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                    continue;
+                }
+                $xml = $z->getFromIndex($i);
+                if (is_string($xml) && $layoutMatches($xml)) {
+                    $hit = true;
+                    break;
+                }
+            }
+            $z->close();
+            if ($hit) {
+                return $sk;
+            }
+        }
+        return null;
+    }
+
     private static function loadSlideXml(string $pptx, int $slide_number): string
     {
         $zip = new ZipArchive();
@@ -533,7 +576,15 @@ class Test extends \PHPUnit\Framework\TestCase
         // When the entire body of a slide is such paragraphs, ppthelper remaps
         // the layout to the skeleton's quote-named layout AND re-anchors the
         // content placeholder to the layout's body-idx (typically 2, not 1).
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        // The bundled assets/skeleton.pptx has no quote layout, so pick the
+        // first input skeleton that does.
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+            return preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $layout_xml) === 1;
+        });
+        if ($skeleton === null) {
+            $this->markTestSkipped('no skeleton with quote/zitat layout available in skeleton_input/');
+        }
+        // re-read the quote layout's metadata for assertions
         $z = new ZipArchive();
         $z->open($skeleton);
         $quote_layout = null;
@@ -566,13 +617,10 @@ class Test extends \PHPUnit\Framework\TestCase
             }
         }
         $z->close();
-        if ($quote_layout === null) {
-            $this->markTestSkipped('bundled skeleton has no quote/zitat layout — remap is a no-op');
-        }
         $md = "# Worth quoting\n\n> Lorem ipsum dolor sit amet.\n>\n> — Cicero, 45 BC";
         $out = sys_get_temp_dir() . '/ppthelper_test_quote_remap.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
         $z = new ZipArchive();
         $z->open($out);
         $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
@@ -659,32 +707,16 @@ class Test extends \PHPUnit\Framework\TestCase
         // (typically the attribution) visibly off-center to the right.
         // remapQuoteSlides must drop the marL after detection so PowerPoint
         // centers over the full body width.
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
-        $z = new ZipArchive();
-        $z->open($skeleton);
-        $has_quote_layout = false;
-        for ($i = 0; $i < $z->numFiles; $i++) {
-            $n = $z->getNameIndex($i);
-            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
-                continue;
-            }
-            $x = $z->getFromIndex($i);
-            if (
-                is_string($x) &&
-                preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $x) === 1
-            ) {
-                $has_quote_layout = true;
-                break;
-            }
-        }
-        $z->close();
-        if (!$has_quote_layout) {
-            $this->markTestSkipped('skeleton has no quote/zitat layout — strip is a no-op');
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+            return preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $layout_xml) === 1;
+        });
+        if ($skeleton === null) {
+            $this->markTestSkipped('no skeleton with quote/zitat layout available in skeleton_input/');
         }
         $md = "# Quote slide\n\n> Lorem ipsum dolor sit amet.\n>\n> — Author";
         $out = sys_get_temp_dir() . '/ppthelper_test_quote_marl.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
         $slide = self::loadSlideXml($out, 1);
         $this->assertDoesNotMatchRegularExpression(
             '#<a:pPr\b[^/]*\bmarL="1270000"#',
@@ -725,6 +757,200 @@ class Test extends \PHPUnit\Framework\TestCase
             '#<p:pic\b[^>]*>(?:(?!</p:pic>).)*?descr="[^"]+"#s',
             $slide,
             'picture alt-text (descr) must be preserved for accessibility'
+        );
+    }
+
+    public function test__picture_fits_within_layout_column_bounds(): void
+    {
+        // Pandoc emits <p:pic> with a hard-coded ~4.4"-wide geometry. On
+        // layouts whose left body-column is narrower (e.g. 3.43"), the pic
+        // would spill into the right column and overlap the text. After
+        // refit the picture's right edge must NOT exceed the left layout
+        // column's right edge.
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+            // pick any two-content layout
+            return preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $layout_xml) === 1;
+        });
+        if ($skeleton === null) {
+            $this->markTestSkipped('no twoObj layout available in skeleton_input/');
+        }
+        // find left+right body-column geometry from the layout
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $left_col = null;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (is_string($x) && preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $x) === 1) {
+                $cols = [];
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $x, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match('#<p:ph\b#', $sp) !== 1) {
+                            continue;
+                        }
+                        if (
+                            preg_match('#<a:off\s+x="(\d+)"\s+y="(\d+)"#', $sp, $om) === 1 &&
+                            preg_match('#<a:ext\s+cx="(\d+)"\s+cy="(\d+)"#', $sp, $em) === 1
+                        ) {
+                            $cols[] = ['x' => (int) $om[1], 'cx' => (int) $em[1]];
+                        }
+                    }
+                }
+                usort($cols, static fn($a, $b) => $a['x'] <=> $b['x']);
+                if (count($cols) >= 2) {
+                    $left_col = $cols[0];
+                }
+                break;
+            }
+        }
+        $z->close();
+        if ($left_col === null) {
+            $this->markTestSkipped('twoObj layout has no usable two-column body geometry');
+        }
+        // render a two-column slide with image left + bullets right
+        $sample_path = sys_get_temp_dir() . '/ppthelper_test_pic_fit_sample.png';
+        if (!is_file($sample_path)) {
+            $im = imagecreatetruecolor(1280, 720);
+            $bg = imagecolorallocate($im, 200, 220, 255);
+            imagefilledrectangle($im, 0, 0, 1280, 720, $bg);
+            imagepng($im, $sample_path);
+            imagedestroy($im);
+        }
+        $md = "# Two col\n\n:::: {.columns}\n::: {.column}\n![pic](" . $sample_path . ")\n:::\n::: {.column}\n- right text\n:::\n::::";
+        $out = sys_get_temp_dir() . '/ppthelper_test_pic_fit.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        $slide = self::loadSlideXml($out, 1);
+        $this->assertMatchesRegularExpression(
+            '#<p:pic\b#',
+            $slide,
+            'two-column slide must contain a picture'
+        );
+        if (
+            preg_match('#<p:pic\b[^>]*>.*?<a:off\s+x="(\d+)"\s+y="\d+"\s*/>.*?<a:ext\s+cx="(\d+)"\s+cy="\d+"\s*/>.*?</p:pic>#s', $slide, $m) === 1
+        ) {
+            $pic_right = (int) $m[1] + (int) $m[2];
+            $col_right = $left_col['x'] + $left_col['cx'];
+            $this->assertLessThanOrEqual(
+                $col_right,
+                $pic_right,
+                "picture right edge ({$pic_right}) must not exceed left layout column right edge ({$col_right})"
+            );
+        } else {
+            $this->fail('could not parse pic geometry');
+        }
+    }
+
+    public function test__two_column_text_left_picture_right_pattern(): void
+    {
+        // Pandoc's column fences are order-positional: first .column is left,
+        // second is right. ppthelper must produce a clean split for BOTH
+        // orderings — image-left/text-right AND text-left/image-right. The
+        // body-idx-normalizer + picture-fit pass should automatically land
+        // the picture in whichever column the markdown specifies, with the
+        // body text in the opposite column. This test exercises the
+        // text-LEFT / picture-RIGHT pattern explicitly.
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+            return preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $layout_xml) === 1;
+        });
+        if ($skeleton === null) {
+            $this->markTestSkipped('no twoObj layout available in skeleton_input/');
+        }
+        // collect the two-column layout's left/right body geometries
+        $z = new ZipArchive();
+        $z->open($skeleton);
+        $cols = [];
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            $n = $z->getNameIndex($i);
+            if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                continue;
+            }
+            $x = $z->getFromIndex($i);
+            if (is_string($x) && preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $x) === 1) {
+                if (preg_match_all('#<p:sp\b[^>]*>.*?</p:sp>#s', $x, $sps) !== false) {
+                    foreach ($sps[0] as $sp) {
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            continue;
+                        }
+                        if (preg_match('#<p:ph\b[^/]*\bidx="(\d+)"#', $sp, $im) !== 1) {
+                            continue;
+                        }
+                        if (
+                            preg_match('#<a:off\s+x="(\d+)"\s+y="\d+"#', $sp, $om) === 1 &&
+                            preg_match('#<a:ext\s+cx="(\d+)"\s+cy="\d+"#', $sp, $em) === 1
+                        ) {
+                            $cols[] = ['idx' => $im[1], 'x' => (int) $om[1], 'cx' => (int) $em[1]];
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        $z->close();
+        if (count($cols) < 2) {
+            $this->markTestSkipped('twoObj layout has fewer than 2 body columns');
+        }
+        usort($cols, static fn($a, $b) => $a['x'] <=> $b['x']);
+        $left_col = $cols[0];
+        $right_col = $cols[1];
+
+        $sample_path = sys_get_temp_dir() . '/ppthelper_test_pattern_b_sample.png';
+        if (!is_file($sample_path)) {
+            $im = imagecreatetruecolor(1280, 720);
+            $bg = imagecolorallocate($im, 220, 200, 240);
+            imagefilledrectangle($im, 0, 0, 1280, 720, $bg);
+            imagepng($im, $sample_path);
+            imagedestroy($im);
+        }
+        // Pattern B: bullets LEFT (first column), image RIGHT (second column)
+        $md = "# Text left, picture right\n\n:::: {.columns}\n::: {.column}\n- LEFT_TEXT_BULLET_A\n- LEFT_TEXT_BULLET_B\n:::\n::: {.column}\n![pic](" . $sample_path . ")\n:::\n::::";
+        $out = sys_get_temp_dir() . '/ppthelper_test_pattern_b.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        $slide = self::loadSlideXml($out, 1);
+
+        // (1) the picture must land in the RIGHT column
+        $this->assertMatchesRegularExpression(
+            '#<p:pic\b#',
+            $slide,
+            'two-column slide must contain a picture'
+        );
+        if (
+            preg_match('#<p:pic\b[^>]*>.*?<a:off\s+x="(\d+)"\s+y="\d+"\s*/>.*?<a:ext\s+cx="(\d+)"\s+cy="\d+"\s*/>.*?</p:pic>#s', $slide, $pm) === 1
+        ) {
+            $pic_x = (int) $pm[1];
+            $pic_right = (int) $pm[1] + (int) $pm[2];
+            $this->assertGreaterThanOrEqual(
+                $right_col['x'],
+                $pic_x,
+                "picture x ({$pic_x}) must be at or right of the right column start ({$right_col['x']})"
+            );
+            $this->assertLessThanOrEqual(
+                $right_col['x'] + $right_col['cx'],
+                $pic_right,
+                "picture right edge ({$pic_right}) must not exceed right column right edge"
+            );
+        } else {
+            $this->fail('could not parse pic geometry');
+        }
+
+        // (2) the bullet body must land in the LEFT column — its <p:ph idx>
+        // must match the layout's left-column idx (not the right one)
+        $this->assertMatchesRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\bidx="' . preg_quote($left_col['idx'], '#') . '"(?:(?!</p:sp>).)*?LEFT_TEXT_BULLET_A#s',
+            $slide,
+            "left-text bullets must be anchored to the LEFT column body-idx ({$left_col['idx']})"
+        );
+        $this->assertDoesNotMatchRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\bidx="' . preg_quote($right_col['idx'], '#') . '"(?:(?!</p:sp>).)*?LEFT_TEXT_BULLET_A#s',
+            $slide,
+            "left-text bullets must NOT be in the RIGHT column (idx {$right_col['idx']})"
         );
     }
 
@@ -849,12 +1075,15 @@ class Test extends \PHPUnit\Framework\TestCase
     public function test__non_quote_slide_keeps_default_layout(): void
     {
         // Plain content slide (bullets, not blockquote) must NOT be remapped
-        // to the quote layout.
-        $md = "# Normal content\n\n- not a quote\n- regular bullet";
-        $out = sys_get_temp_dir() . '/ppthelper_test_quote_skip.pptx';
-        @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        // to the quote layout. Run against an input skeleton that actually
+        // has a quote layout so the negative assertion is meaningful.
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+            return preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $layout_xml) === 1;
+        });
+        if ($skeleton === null) {
+            $this->markTestSkipped('no skeleton with quote/zitat layout available — negative assertion is vacuous');
+        }
+        // find the quote layout's basename for the negative check
         $z = new ZipArchive();
         $z->open($skeleton);
         $quote_layout = null;
@@ -874,9 +1103,10 @@ class Test extends \PHPUnit\Framework\TestCase
             }
         }
         $z->close();
-        if ($quote_layout === null) {
-            $this->markTestSkipped('no quote layout in skeleton — nothing to keep away from');
-        }
+        $md = "# Normal content\n\n- not a quote\n- regular bullet";
+        $out = sys_get_temp_dir() . '/ppthelper_test_quote_skip.pptx';
+        @unlink($out);
+        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
         $z = new ZipArchive();
         $z->open($out);
         $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
@@ -962,34 +1192,45 @@ class Test extends \PHPUnit\Framework\TestCase
 
     public function test__dt_rewritten_to_live_field_when_layout_uses_one(): void
     {
-        // The post-process rewrites Pandoc's static date text into a live
-        // <a:fld type="datetime1"> ONLY when the layout's own dt placeholder
-        // uses one (rotated/narrow boxes need the compact PowerPoint format).
-        // Skip when the bundled skeleton ships a layout that already uses
-        // static text — the rewrite is intentionally a no-op there.
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
-        $z = new ZipArchive();
-        $z->open($skeleton);
-        $layout1 = $z->getFromName('ppt/slideLayouts/slideLayout1.xml');
-        $z->close();
-        $layout_has_live_dt = false;
-        if (
-            is_string($layout1) &&
-            preg_match(
-                '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
-                $layout1,
-                $dtm
-            ) === 1
-        ) {
-            $layout_has_live_dt = preg_match('#<a:fld\b[^>]*type="datetime1"#', $dtm[0]) === 1;
-        }
-        if (!$layout_has_live_dt) {
-            $this->markTestSkipped('bundled skeleton layout1 has no live datetime1 field — rewrite is a no-op');
+        // ppthelper rewrites Pandoc's static date text into a live
+        // <a:fld type="datetime1"> when the layout signals it needs the
+        // compact "DD.MM.YYYY" form — i.e. either:
+        //   - the layout's dt placeholder ALREADY uses a live datetime1 field
+        //   - the dt box is rotated 90° (rot="5400000")
+        //   - the dt box is very narrow (cx < ~1.6")
+        // Pick any skeleton whose layout matches one of those signals.
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+            if (
+                preg_match(
+                    '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
+                    $layout_xml,
+                    $dtm
+                ) !== 1
+            ) {
+                return false;
+            }
+            if (preg_match('#<a:fld\b[^>]*type="datetime1"#', $dtm[0]) === 1) {
+                return true;
+            }
+            if (preg_match('#<a:xfrm\b[^>]*\brot="5400000"#', $dtm[0]) === 1) {
+                return true;
+            }
+            if (
+                preg_match('#<a:ext\b[^>]*\bcx="(\d+)"#', $dtm[0], $cxm) === 1
+                && (int) $cxm[1] > 0
+                && (int) $cxm[1] < 1500000
+            ) {
+                return true;
+            }
+            return false;
+        });
+        if ($skeleton === null) {
+            $this->markTestSkipped('no skeleton with a live datetime1 dt-placeholder available — rewrite is a no-op');
         }
         $md = "% Cover Title\n% Subtitle\n% 22. Mai 2026\n\n# Content\n\n- bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_dt_live.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
         $slide1 = self::loadSlideXml($out, 1);
         if (preg_match(
             '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
@@ -1049,5 +1290,263 @@ class Test extends \PHPUnit\Framework\TestCase
             $gfm[0],
             'small table must still have an <a:ext>'
         );
+    }
+
+    /**
+     * Renders one realistic charly-style deck (~21 slides, all reachable
+     * layouts: cover, agenda, section-headers, content with bullets/tables,
+     * two-column with image, quote, image-only, speaker-notes) against every
+     * skeleton in `tests/skeleton_input/` and writes the result to
+     * `tests/skeleton_output/`. The output is a manual-review fixture — the
+     * test only sanity-checks file existence + slide count, the actual visual
+     * comparison happens by the reviewer opening each .pptx in PowerPoint.
+     */
+    public function test__render_all_skeletons_for_manual_review(): void
+    {
+        $input_dir = dirname(__DIR__) . '/tests/skeleton_input';
+        $output_dir = dirname(__DIR__) . '/tests/skeleton_output';
+        if (!is_dir($input_dir)) {
+            $this->markTestSkipped('skeleton_input directory missing — drop *.pptx files in there first');
+        }
+        // glob *.pptx but skip Office lock-files (~$skeleton01.pptx is
+        // created while a deck is open in PowerPoint and matches *.pptx too)
+        $skeletons = array_values(array_filter(
+            glob($input_dir . '/*.pptx') ?: [],
+            static fn(string $p): bool => !str_starts_with(basename($p), '~$')
+        ));
+        if ($skeletons === []) {
+            $this->markTestSkipped('no skeletons in tests/skeleton_input/');
+        }
+        if (!is_dir($output_dir) && !mkdir($output_dir, 0775, true) && !is_dir($output_dir)) {
+            $this->fail('failed to create tests/skeleton_output');
+        }
+        // wipe previous review outputs so a reviewer never opens a stale file
+        // from a previous run. leave Office lock-files (~$...) alone — the
+        // reviewer may have a previous output still open, and unlink would
+        // fail noisily.
+        foreach (glob($output_dir . '/*') ?: [] as $stale) {
+            if (str_starts_with(basename($stale), '~$')) {
+                continue;
+            }
+            @unlink($stale);
+        }
+        // generate one neutral placeholder PNG (16:9, 1280x720) outside the
+        // review folder so the markdown's `![]()` references resolve without
+        // hitting an image-gen API and the review folder stays clean
+        $placeholder_path = sys_get_temp_dir() . '/ppthelper_skeleton_placeholder.png';
+        if (!is_file($placeholder_path)) {
+            $im = imagecreatetruecolor(1280, 720);
+            $bg = imagecolorallocate($im, 235, 240, 248);
+            $accent = imagecolorallocate($im, 80, 110, 180);
+            $line = imagecolorallocate($im, 200, 215, 235);
+            imagefilledrectangle($im, 0, 0, 1280, 720, $bg);
+            for ($i = 0; $i < 8; $i++) {
+                $y = (int) (90 + $i * 70);
+                imageline($im, 80, $y, 1200, $y, $line);
+            }
+            imagefilledrectangle($im, 540, 280, 740, 440, $accent);
+            imagestring($im, 5, 540, 460, 'SAMPLE 16:9', $accent);
+            imagepng($im, $placeholder_path);
+            imagedestroy($im);
+        }
+        $md = self::buildSampleDeckMarkdown($placeholder_path);
+        $failures = [];
+        foreach ($skeletons as $skeleton) {
+            $stem = pathinfo($skeleton, PATHINFO_FILENAME);
+            $out = $output_dir . '/' . $stem . '.pptx';
+            try {
+                ppthelper::render([
+                    'input_markdown' => $md,
+                    'input_template' => $skeleton,
+                    'output' => $out,
+                ]);
+            } catch (\Throwable $e) {
+                $failures[] = $stem . ': ' . $e->getMessage();
+                continue;
+            }
+            if (!is_file($out)) {
+                $failures[] = $stem . ': output file not written';
+                continue;
+            }
+            $slide_count = self::countSlides($out);
+            if ($slide_count < 10) {
+                $failures[] = $stem . ': only ' . $slide_count . ' slides rendered (expected ≥10)';
+            }
+        }
+        if ($failures !== []) {
+            $this->fail(
+                "Skeleton renders had failures:\n  - " . implode("\n  - ", $failures)
+            );
+        }
+        // per-file assertion — robust against any stray files that may sit in
+        // the output dir for unrelated reasons (e.g. a reviewer drag-and-dropping
+        // their own .pptx for comparison)
+        foreach ($skeletons as $skeleton) {
+            $expected = $output_dir . '/' . pathinfo($skeleton, PATHINFO_FILENAME) . '.pptx';
+            $this->assertFileExists(
+                $expected,
+                'no output produced for skeleton ' . basename($skeleton)
+            );
+        }
+    }
+
+    /**
+     * The shared markdown blob used by test__render_all_skeletons_for_manual_review.
+     * Covers every layout pattern ppthelper supports: title slide with subtitle,
+     * an agenda slide, section-header slides (empty body → auto-remapped to
+     * secHead), title+bullets slides, two-column image+bullets slides,
+     * tables of different sizes (3 and 7 rows), a quote slide, a bare image
+     * slide, and slides with speaker notes.
+     */
+    private static function buildSampleDeckMarkdown(string $sample_image_path): string
+    {
+        $img = $sample_image_path;
+        $style = 'Flat vector illustration, isometric perspective, soft blue and white palette, minimal composition, clean lines, white background, no text overlays.';
+        return <<<MD
+% KI in Unternehmen
+% Strategie, Wert & Umsetzung
+% 23. Mai 2026
+
+# Agenda
+
+- 1. Marktdynamik
+- 2. Werthebel
+- 3. Daten & Plattform
+- 4. Governance
+- 5. Roadmap & Fazit
+
+# Teil 1: Marktdynamik
+
+# Adoption steigt rasant
+
+- 78 % der Unternehmen nutzen GenAI wöchentlich
+- Pilot-zu-Produktion bleibt das Nadelöhr
+- Investitionen verdoppeln sich jedes Jahr
+- Skill-Gap wird zur Engpass-Disziplin
+
+::: notes
+Quellen: McKinsey State of AI 2025, Stanford AI Index 2025, BCG 2024.
+Konkrete Zahl zur Adoption-Tiefe (1× pro Woche, 1× pro Tag, in Kernprozesse) im Anhang.
+:::
+
+# Markttrends 2026 im Bild
+
+:::: {.columns}
+::: {.column}
+![Marktdynamik]($img)
+:::
+::: {.column}
+- Agentic AI verlässt das Lab
+- Multimodale Modelle werden Standard
+- On-Device-Inferenz für sensible Daten
+- Open-Source-Modelle holen auf
+:::
+::::
+
+# Kernzahlen 2024–2026
+
+| Indikator | 2024 | 2025 | 2026e |
+|---|---|---|---|
+| KI-Nutzung (wöchentlich) | 56 % | 71 % | 78 % |
+| Skalierte Use Cases | 12 % | 19 % | 26 % |
+| KI-Investitionen | 180 Mrd | 252 Mrd | 320 Mrd |
+| Skills-Gap | hoch | hoch | mittel |
+| Governance-Reife | niedrig | mittel | mittel |
+
+# Teil 2: Werthebel
+
+# Wo Wert entsteht
+
+:::: {.columns}
+::: {.column}
+- Umsatz: Pricing, Sales, Cross-Sell
+- Kosten: Automation und Qualität
+- Tempo: kürzere Zyklen, weniger Rework
+- Innovation: neue Produkte & Services
+:::
+::: {.column}
+![Werthebel]($img)
+:::
+::::
+
+# Was Andrew Ng sagt
+
+> KI ersetzt nicht Menschen. Menschen mit KI ersetzen Menschen ohne KI.
+>
+> — frei nach Andrew Ng
+
+# Use-Case-Portfolio
+
+| Bereich | Use Case | Reife |
+|---|---|---|
+| Service | Agent Assist | hoch |
+| Marketing | Content-Engine | hoch |
+| Operations | Forecasting | mittel |
+| HR | Recruiting Copilot | mittel |
+| Finance | Anomalie-Erkennung | niedrig |
+
+# Teil 3: Daten & Plattform
+
+# Daten als Engpass
+
+:::: {.columns}
+::: {.column}
+![Daten-Plattform]($img)
+:::
+::: {.column}
+- Datenqualität limitiert die meisten Piloten
+- Ownership fehlt fast überall
+- Vektor-DBs werden zur Pflicht
+- Cost-Tracking pro Workflow wird neu
+:::
+::::
+
+# Architektur-Zielbild
+
+![Architektur]($img)
+
+# Teil 4: Governance
+
+# EU AI Act kompakt
+
+- Anwendungspflicht ab 2026 stufenweise
+- High-Risk-Pflichten ab August 2026
+- Dokumentation und Audit-Trail werden Pflicht
+- Schatten-KI ist heute schon ein Risiko
+
+::: notes
+Detail-Timeline siehe Greenberg-Traurig 2025 Compliance-Guide.
+Übergang: "Bevor wir zur Roadmap kommen, kurz zu den Kontrollen..."
+:::
+
+# Teil 5: Roadmap & Fazit
+
+# 12-Monats-Roadmap
+
+| Quartal | Fokus | Ergebnis |
+|---|---|---|
+| Q1 | Strategie & Portfolio | Use-Case-Liste |
+| Q2 | Plattform & Piloten | produktive MVPs |
+| Q3 | Skalierung | Rollout |
+
+# Erfolgsfaktoren
+
+- Vorstands-Sponsoring mit klarer Verantwortung
+- Fokus auf wenige, messbare Werthebel
+- Daten- und Prozessarbeit vor Modell-Faszination
+- Governance als Beschleuniger, nicht als Bremse
+
+# Fazit
+
+- KI ist Organisationsentwicklung, kein IT-Projekt
+- Wettbewerbsvorteil entsteht durch integrierte Workflows
+- Verantwortungsvolle Skalierung braucht Leitplanken
+- Jetzt zählt: priorisieren, produktiv setzen, lernen, skalieren
+
+::: notes
+Letzte Folie — Schlussbotschaft für die Diskussion: "Wenn wir in 12 Monaten zurückblicken,
+woran erkennen wir, dass dieses Programm erfolgreich war?"
+:::
+MD;
     }
 }
