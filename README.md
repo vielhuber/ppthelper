@@ -37,9 +37,9 @@ use vielhuber\ppthelper\ppthelper;
 ```php
 $path = ppthelper::render([
     'output' => 'deck.pptx',
-    'input_markdown' => "% Quarterly Update\n% acme corp\n\n# Highlights\n\n- Revenue up 23%\n- 4 new markets",
-    'input_file' => null,
-    'input_template' => null,
+    'content_markdown' => "% Quarterly Update\n% acme corp\n\n# Highlights\n\n- Revenue up 23%\n- 4 new markets",
+    'content_file' => null,
+    'style_template' => null,             // null | 'default' | 'ion' | 'facet' | …
     'colors_primary' => '#1F4E79',
     'colors_secondary' => '#F59E0B',
     'colors_background' => '#FFFFFF',
@@ -57,9 +57,39 @@ read markdown from a file instead of inline:
 ```php
 $path = ppthelper::render([
     'output' => 'deck.pptx',
-    'input_file' => 'slides.md'
+    'content_file' => 'slides.md'
 ]);
 ```
+
+### styles
+
+`style_template` selects the deck's look:
+
+- `null` or `'default'` → bundled `assets/default.pptx` (Office)
+- a **slug** like `'ion'`, `'facet'`, `'circuit'` → the bundled `assets/<slug>.pptx`
+- an **absolute path** to a `.pptx` → your own custom reference deck
+
+Bundled slugs (all derived from the standard PowerPoint theme set, full
+slideLayouts retained):
+
+| slug | look | slug | look |
+|---|---|---|---|
+| `default` | Office (clean, neutral) | `mesh` | grey grid texture |
+| `badge` | bold yellow accent | `metropolitan` | teal corporate |
+| `banded` | bright bands | `office-classic` | Office 2013/2022 |
+| `basis` | green/yellow grid | `office-classic-2` | (variant) |
+| `berlin` | warm orange | `organic` | earthy green/brown |
+| `circuit` | tech green | `parcel` | warm orange tan |
+| `damask` | green damask pattern | `quotable` | turquoise minimal |
+| `dividend` | deep wine | `retrospect` | orange retro |
+| `droplet` | blue water-drop | `segment` | navy segmented |
+| `facet` | bright lime green | `slate` | dark slate |
+| `frame` | grey framed | `slice` | red sliced |
+| `frame-2` | (variant) | `vapor-trail` | red contrail |
+| `frame-3` | (variant) | `wisp` | grey vapor |
+| `gallery` | wine red museum | `wood-type` | rustic woodcut |
+| `headlines` | bold red headline | `ion` | red modern |
+| `integral` | cyan minimal | `ion-boardroom` | magenta boardroom |
 
 ### image paths
 
@@ -259,7 +289,7 @@ pass at render-time, not in the markdown:
 
 ```php
 ppthelper::render([
-    'input_markdown' => $md,
+    'content_markdown' => $md,
     'output' => 'deck.pptx',
     'transitions' => 'fade',   // false | 'fade' | 'slide'
     'animations'  => true,     // body bullets appear one click at a time
@@ -320,13 +350,13 @@ this single markdown blob renders into a 7-slide deck (title · section · conte
 
 ### custom template
 
-bring your own corporate `reference.pptx` (slide masters, default layouts, logo, fonts) and ppthelper themes a copy of it on every render:
+bring your own corporate `reference.pptx` (slide masters, default layouts, logo, fonts) and ppthelper themes a copy of it on every render — just pass an absolute path as `style_template`:
 
 ```php
 $path = ppthelper::render([
     'output' => 'deck.pptx',
-    'input_markdown' => $md,
-    'input_template' => __DIR__ . '/templates/corporate.pptx',
+    'content_markdown' => $md,
+    'style_template' => __DIR__ . '/templates/corporate.pptx',
     'colors_primary' => '#003366'
 ]);
 ```
@@ -343,6 +373,6 @@ vendor/bin/mcp-server.php
 
 the server speaks both stdio (CLI invocation) and HTTP via [simplemcp](https://github.com/vielhuber/simplemcp). `auth: 'static'` mode expects the bearer token in `MCP_TOKEN`.
 
-the tool exposes `render_deck(markdown, transitions?, animations?, output?)`. theme parameters (colors, fonts, background) are intentionally **not** part of the mcp surface — llms otherwise reflexively override the carefully designed skeleton theme. for forced theming use `ppthelper::render(...)` directly from php or the cli.
+the tool exposes `render_deck(markdown, style_template?, transitions?, animations?, output?)`. `style_template` accepts any of the bundled slugs (`'ion'`, `'facet'`, `'circuit'`, …; see "styles" above) — let the LLM pick a look that matches the deck topic. color/font theme overrides are intentionally **not** part of the mcp surface — llms otherwise reflexively replace the curated theme with a generic "modern" palette. for hard-forced theming use `ppthelper::render(...)` directly from php or the cli.
 
 `output` accepts any absolute or relative path; relative paths resolve against the working directory the server was launched from. omit it to get a tempfile back.

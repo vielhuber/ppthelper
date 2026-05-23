@@ -13,15 +13,14 @@ use vielhuber\simplemcp\Attributes\McpTool;
  * Companion to excelhelper / aihelper: pure static API, options-array style.
  *
  *   ppthelper::render([
- *       'input_markdown' => '# Slide 1 …',
+ *       'content_markdown' => '# Slide 1 …',
  *       'output' => '/path/to/deck.pptx',
- *       'colors_primary' => '#1F4E79',
- *       'fonts_heading' => 'Aptos Display',
+ *       'style_template' => 'ion-boardroom',
  *       'transitions' => 'fade',
  *       'animations' => true
  *   ]);
  *
- * Each call (a) builds a themed copy of the bundled `assets/skeleton.pptx`
+ * Each call (a) builds a themed copy of the chosen style template
  * (mutating ppt/theme/theme1.xml), (b) runs pandoc with that as
  * `--reference-doc`, then (c) optionally post-processes the resulting .pptx
  * to inject slide transitions and per-bullet click-to-advance animations.
@@ -41,12 +40,16 @@ class ppthelper
      * Render a Markdown deck into an editable .pptx and return its path.
      *
      * Accepted options (all flat keys):
-     *   - `input_markdown` (string) — inline Pandoc-Markdown content. Mutually
-     *     exclusive with `input_file`; exactly one of the two is required.
-     *   - `input_file` (string) — path to a markdown file to read instead of
+     *   - `content_markdown` (string) — inline Pandoc-Markdown content. Mutually
+     *     exclusive with `content_file`; exactly one of the two is required.
+     *   - `content_file` (string) — path to a markdown file to read instead of
      *     passing content inline.
-     *   - `input_template` (string, optional) — path to a custom reference.pptx
-     *     skeleton. Defaults to the bundled `assets/skeleton.pptx`.
+     *   - `style_template` (null|string, optional) — selects the look:
+     *       - `null` or `'default'` → bundled `assets/default.pptx`
+     *       - any other slug like `'ion'`, `'facet'`, `'circuit'`, … →
+     *         bundled `assets/<slug>.pptx`
+     *       - absolute path to a `.pptx` → custom reference deck
+     *     See README for the full list of bundled styles.
      *   - `output` (string, optional) — output .pptx path. If omitted a
      *     tempfile is created and its path returned.
      *   - `colors_primary` (hex, e.g. "#1F4E79") → `<a:accent1>` and `<a:dk2>`
@@ -92,9 +95,9 @@ class ppthelper
             $output = $caller_cwd . '/' . $output;
         }
 
-        $template = $args['input_template'] ?? (dirname(__DIR__) . '/assets/skeleton.pptx');
-        if (!is_string($template) || !is_file($template)) {
-            throw new RuntimeException('ppthelper::render: input_template skeleton not found at ' . (string) $template);
+        $template = self::resolveStyleTemplate($args['style_template'] ?? null);
+        if (!is_file($template)) {
+            throw new RuntimeException('ppthelper::render: style_template not found at ' . $template);
         }
 
         $pandoc_path = (string) ($args['pandoc_path'] ?? 'pandoc');
@@ -233,6 +236,7 @@ class ppthelper
      *     standard Pandoc-Markdown.
      *
      * @param string $markdown The complete deck as one Pandoc-Markdown blob.
+     * @param string|null $style_template Selects the deck's visual style. `null` or `"default"` uses the bundled default look; any other slug like `"ion"`, `"facet"`, `"circuit"`, `"slate"`, `"droplet"`, `"banded"`, `"berlin"`, `"badge"`, `"basis"`, `"frame"`, `"wisp"`, `"dividend"`, `"damask"`, `"gallery"`, `"headlines"`, `"integral"`, `"mesh"`, `"metropolitan"`, `"office-classic"`, `"organic"`, `"parcel"`, `"quotable"`, `"retrospect"`, `"segment"`, `"slice"`, `"vapor-trail"`, `"wood-type"`, `"ion-boardroom"` picks the bundled style with that name. See README for the full list.
      * @param string|null $transitions Slide transition applied to every slide. One of: null (none), "fade", "slide".
      * @param bool|null $animations When true, body bullets appear one click at a time (PowerPoint "Appear → By Paragraph").
      * @param string|null $output Output path. Relative paths resolve against the caller's cwd. If null, a tempfile is used and its path returned.
@@ -241,17 +245,20 @@ class ppthelper
     #[McpTool(name: 'render_deck')]
     public function renderDeck(
         string $markdown,
+        ?string $style_template = null,
         ?string $transitions = null,
         ?bool $animations = null,
         ?string $output = null
     ): array {
-        // Theme parameters (primary/accent/background/text colors, heading/body fonts)
-        // are intentionally NOT exposed through the MCP interface — LLMs reflexively
-        // fill them with their own "modern default" palette, overwriting the carefully
-        // curated skeleton theme. Callers needing to force a theme can still use the
-        // PHP `render()` entry point or the CLI directly.
+        // Color/font theme parameters are intentionally NOT exposed through the
+        // MCP interface — LLMs reflexively fill them with a generic "modern
+        // default" palette, overwriting the curated style. To switch the look,
+        // use `style_template` (a slug picking a bundled .pptx). Callers
+        // needing to force individual colors/fonts can still use the PHP
+        // `render()` entry point or the CLI directly.
         $path = self::render([
-            'input_markdown' => $markdown,
+            'content_markdown' => $markdown,
+            'style_template' => $style_template,
             'output' => $output,
             'transitions' => $transitions !== null && $transitions !== '' ? $transitions : false,
             'animations' => (bool) ($animations ?? false)
@@ -264,35 +271,76 @@ class ppthelper
     // ====================================================================
 
     /**
-     * Read the markdown content from either an inline string (`input_markdown`)
-     * or a file path (`input_file`). Mutually exclusive: passing both, or
+     * Read the markdown content from either an inline string (`content_markdown`)
+     * or a file path (`content_file`). Mutually exclusive: passing both, or
      * neither, raises.
      */
     private static function resolveMarkdown(array $args): string
     {
-        $has_inline = isset($args['input_markdown']) && $args['input_markdown'] !== '';
-        $has_file = isset($args['input_file']) && $args['input_file'] !== '';
+        $has_inline = isset($args['content_markdown']) && $args['content_markdown'] !== '';
+        $has_file = isset($args['content_file']) && $args['content_file'] !== '';
         if ($has_inline && $has_file) {
-            throw new RuntimeException('ppthelper::render: pass either "input_markdown" or "input_file", not both.');
+            throw new RuntimeException('ppthelper::render: pass either "content_markdown" or "content_file", not both.');
         }
         if (!$has_inline && !$has_file) {
-            throw new RuntimeException('ppthelper::render: one of "input_markdown" (inline) or "input_file" (path) is required.');
+            throw new RuntimeException('ppthelper::render: one of "content_markdown" (inline) or "content_file" (path) is required.');
         }
         if ($has_inline) {
-            if (!is_string($args['input_markdown'])) {
-                throw new RuntimeException('ppthelper::render: option "input_markdown" must be a string.');
+            if (!is_string($args['content_markdown'])) {
+                throw new RuntimeException('ppthelper::render: option "content_markdown" must be a string.');
             }
-            return $args['input_markdown'];
+            return $args['content_markdown'];
         }
-        $file = $args['input_file'];
+        $file = $args['content_file'];
         if (!is_string($file) || !is_file($file)) {
-            throw new RuntimeException('ppthelper::render: input_file not found at ' . (string) $file);
+            throw new RuntimeException('ppthelper::render: content_file not found at ' . (string) $file);
         }
         $content = @file_get_contents($file);
         if ($content === false) {
-            throw new RuntimeException('ppthelper::render: failed to read input_file ' . $file);
+            throw new RuntimeException('ppthelper::render: failed to read content_file ' . $file);
         }
         return $content;
+    }
+
+    /**
+     * Resolve `style_template` to a concrete `.pptx` skeleton path.
+     *
+     *   null | ''        → bundled assets/default.pptx
+     *   'default'        → bundled assets/default.pptx
+     *   'ion' | 'facet'  → bundled assets/<slug>.pptx (any slug whose .pptx ships)
+     *   '/abs/path.pptx' → that file verbatim
+     *
+     * Non-existent bundled slugs raise so the user gets a precise error instead
+     * of pandoc failing later with a generic "couldn't find layout" warning.
+     */
+    private static function resolveStyleTemplate(mixed $value): string
+    {
+        $assets = dirname(__DIR__) . '/assets';
+        if ($value === null || $value === '' || $value === 'default') {
+            return $assets . '/default.pptx';
+        }
+        if (!is_string($value)) {
+            throw new RuntimeException('ppthelper::render: option "style_template" must be a string or null.');
+        }
+        // absolute path → use verbatim
+        if (str_starts_with($value, '/')) {
+            return $value;
+        }
+        // bundled slug (e.g. "ion", "ion-boardroom", "facet")
+        if (preg_match('#^[a-z0-9][a-z0-9-]*$#', $value) === 1) {
+            $candidate = $assets . '/' . $value . '.pptx';
+            if (!is_file($candidate)) {
+                throw new RuntimeException(
+                    'ppthelper::render: unknown style_template "' . $value . '" — '
+                        . 'no bundled assets/' . $value . '.pptx. '
+                        . 'See README for the list of available styles, or pass an absolute path.'
+                );
+            }
+            return $candidate;
+        }
+        throw new RuntimeException(
+            'ppthelper::render: style_template must be null, a bundled slug, or an absolute path. Got: ' . $value
+        );
     }
 
     /**

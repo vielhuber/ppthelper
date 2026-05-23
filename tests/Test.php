@@ -6,43 +6,75 @@ use vielhuber\ppthelper\ppthelper;
 class Test extends \PHPUnit\Framework\TestCase
 {
     /**
-     * Find the first skeleton in `tests/skeleton_input/` whose `slideLayout*.xml`
+     * Find the first skeleton in `assets/` whose `slideLayout*.xml`
      * collection satisfies the predicate. Returns the absolute path, or null
      * if none match. Used by tests that need a feature the bundled
-     * `assets/skeleton.pptx` doesn't ship with (e.g. a quote-typed layout
+     * `assets/default.pptx` doesn't ship with (e.g. a quote-typed layout
      * or a live <a:fld type="datetime1"> field on the title slide).
      */
-    private static function findSkeletonWithFeature(callable $layoutMatches): ?string
+    /**
+     * @var array<string, list<string>>|null
+     * cache: skeleton-path → list of slideLayout XML blobs (lazy-loaded once)
+     */
+    private static ?array $skeletonLayoutsCache = null;
+
+    /**
+     * Load every input skeleton's slideLayout XMLs into a flat in-memory map.
+     * Done once per test-suite run, regardless of how many tests call
+     * findSkeletonWithFeature() afterwards. Without the cache, six tests
+     * each open 32 ZipArchives → 192 reify+close cycles that OOM the
+     * macOS GitHub Actions runner.
+     */
+    private static function loadAllSkeletonLayouts(): array
     {
-        $dir = dirname(__DIR__) . '/tests/skeleton_input';
+        if (self::$skeletonLayoutsCache !== null) {
+            return self::$skeletonLayoutsCache;
+        }
+        $dir = dirname(__DIR__) . '/assets';
         if (!is_dir($dir)) {
-            return null;
+            return self::$skeletonLayoutsCache = [];
         }
         $skeletons = array_values(array_filter(
             glob($dir . '/*.pptx') ?: [],
             static fn(string $p): bool => !str_starts_with(basename($p), '~$')
         ));
         sort($skeletons);
+        $cache = [];
         foreach ($skeletons as $sk) {
             $z = new ZipArchive();
             if ($z->open($sk) !== true) {
                 continue;
             }
-            $hit = false;
+            $layouts = [];
             for ($i = 0; $i < $z->numFiles; $i++) {
                 $n = $z->getNameIndex($i);
-                if (!is_string($n) || preg_match('#^ppt/slideLayouts/slideLayout\d+\.xml$#', $n) !== 1) {
+                if (!is_string($n) || preg_match('#^ppt/slideLayouts/(slideLayout\d+\.xml)$#', $n, $lm) !== 1) {
                     continue;
                 }
                 $xml = $z->getFromIndex($i);
-                if (is_string($xml) && $layoutMatches($xml)) {
-                    $hit = true;
-                    break;
+                if (is_string($xml)) {
+                    $layouts[$lm[1]] = $xml;
                 }
             }
             $z->close();
-            if ($hit) {
-                return $sk;
+            $cache[$sk] = $layouts;
+        }
+        return self::$skeletonLayoutsCache = $cache;
+    }
+
+    /**
+     * Predicate signature: `fn(string $layout_xml, string $layout_name): bool`.
+     * `$layout_name` is e.g. `slideLayout1.xml` — tests that only care about
+     * the title slide (cover) can filter on `slideLayout1.xml`. Legacy
+     * one-arg predicates ignoring the second parameter still work.
+     */
+    private static function findSkeletonWithFeature(callable $layoutMatches): ?string
+    {
+        foreach (self::loadAllSkeletonLayouts() as $path => $layouts) {
+            foreach ($layouts as $layout_name => $xml) {
+                if ($layoutMatches($xml, $layout_name)) {
+                    return $path;
+                }
             }
         }
         return null;
@@ -95,7 +127,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_basic.pptx';
         @unlink($out);
         $path = ppthelper::render([
-            'input_markdown' => "# First slide\n\n- one\n- two\n\n# Second slide\n\nContent body.",
+            'content_markdown' => "# First slide\n\n- one\n- two\n\n# Second slide\n\nContent body.",
             'output' => $out
         ]);
         $this->assertSame($out, $path);
@@ -111,7 +143,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_theme.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => '# Themed',
+            'content_markdown' => '# Themed',
             'output' => $out,
             'colors_primary' => '#DC2626',
             'colors_secondary' => '#F59E0B',
@@ -130,20 +162,20 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_hash.pptx';
         @unlink($out);
         // with hash
-        ppthelper::render(['input_markdown' => '# X', 'output' => $out, 'colors_primary' => '#1F4E79']);
+        ppthelper::render(['content_markdown' => '# X', 'output' => $out, 'colors_primary' => '#1F4E79']);
         $this->assertMatchesRegularExpression('#<a:accent1>\s*<a:srgbClr val="1F4E79"/>#', self::loadThemeXml($out));
         // without hash — still accepted
-        ppthelper::render(['input_markdown' => '# X', 'output' => $out, 'colors_primary' => '1F4E79']);
+        ppthelper::render(['content_markdown' => '# X', 'output' => $out, 'colors_primary' => '1F4E79']);
         $this->assertMatchesRegularExpression('#<a:accent1>\s*<a:srgbClr val="1F4E79"/>#', self::loadThemeXml($out));
     }
 
-    public function test__input_file(): void
+    public function test__content_file(): void
     {
         $md_path = sys_get_temp_dir() . '/ppthelper_test_input.md';
         file_put_contents($md_path, "# From file\n\n- one\n- two");
         $out = sys_get_temp_dir() . '/ppthelper_test_input.pptx';
         @unlink($out);
-        ppthelper::render(['input_file' => $md_path, 'output' => $out]);
+        ppthelper::render(['content_file' => $md_path, 'output' => $out]);
         $this->assertFileExists($out);
         $this->assertStringContainsString('From file', self::loadSlideXml($out, 1));
         @unlink($md_path);
@@ -151,17 +183,17 @@ class Test extends \PHPUnit\Framework\TestCase
 
     public function test__markdown_and_input_mutually_exclusive(): void
     {
-        $this->expectExceptionMessageMatches('#pass either "input_markdown" or "input_file"#');
+        $this->expectExceptionMessageMatches('#pass either "content_markdown" or "content_file"#');
         ppthelper::render([
-            'input_markdown' => '# X',
-            'input_file' => '/tmp/whatever.md',
+            'content_markdown' => '# X',
+            'content_file' => '/tmp/whatever.md',
             'output' => sys_get_temp_dir() . '/x.pptx'
         ]);
     }
 
     public function test__missing_input_raises(): void
     {
-        $this->expectExceptionMessageMatches('#one of "input_markdown"#');
+        $this->expectExceptionMessageMatches('#one of "content_markdown"#');
         ppthelper::render(['output' => sys_get_temp_dir() . '/x.pptx']);
     }
 
@@ -169,7 +201,7 @@ class Test extends \PHPUnit\Framework\TestCase
     {
         $this->expectExceptionMessageMatches('#Invalid color#');
         ppthelper::render([
-            'input_markdown' => '# X',
+            'content_markdown' => '# X',
             'output' => sys_get_temp_dir() . '/x.pptx',
             'colors_primary' => 'not-a-color'
         ]);
@@ -180,7 +212,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_trans.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# A\n- one\n\n# B\n- two",
+            'content_markdown' => "# A\n- one\n\n# B\n- two",
             'output' => $out,
             'transitions' => 'fade'
         ]);
@@ -195,7 +227,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_slide_trans.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# A\n- one",
+            'content_markdown' => "# A\n- one",
             'output' => $out,
             'transitions' => 'slide'
         ]);
@@ -207,7 +239,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_anim.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# Bullets\n\n- one\n- two\n- three",
+            'content_markdown' => "# Bullets\n\n- one\n- two\n- three",
             'output' => $out,
             'animations' => true
         ]);
@@ -226,7 +258,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_title_anim.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "% Deck title\n% Author name\n\n# Content slide\n\n- bullet",
+            'content_markdown' => "% Deck title\n% Author name\n\n# Content slide\n\n- bullet",
             'output' => $out,
             'animations' => true
         ]);
@@ -238,11 +270,11 @@ class Test extends \PHPUnit\Framework\TestCase
 
     public function test__empty_markdown_rejected_upfront(): void
     {
-        // Empty input_markdown is caught at the resolve step before pandoc
+        // Empty content_markdown is caught at the resolve step before pandoc
         // ever runs — same error path as omitting the argument entirely.
-        $this->expectExceptionMessageMatches('#one of "input_markdown"#');
+        $this->expectExceptionMessageMatches('#one of "content_markdown"#');
         ppthelper::render([
-            'input_markdown' => '',
+            'content_markdown' => '',
             'output' => sys_get_temp_dir() . '/empty.pptx'
         ]);
     }
@@ -259,7 +291,7 @@ class Test extends \PHPUnit\Framework\TestCase
         try {
             $out = $work . '/relimg.pptx';
             ppthelper::render([
-                'input_markdown' => "# Image slide\n\n![dot](dot.png)",
+                'content_markdown' => "# Image slide\n\n![dot](dot.png)",
                 'output' => $out
             ]);
             $zip = new ZipArchive();
@@ -290,7 +322,7 @@ class Test extends \PHPUnit\Framework\TestCase
         try {
             $out = sys_get_temp_dir() . '/ppthelper_test_abs.pptx';
             ppthelper::render([
-                'input_markdown' => "# Image slide\n\n![dot](" . $img . ")",
+                'content_markdown' => "# Image slide\n\n![dot](" . $img . ")",
                 'output' => $out
             ]);
             $zip = new ZipArchive();
@@ -317,10 +349,10 @@ class Test extends \PHPUnit\Framework\TestCase
         // colors/fonts the skeleton happens to ship with.
         $out = sys_get_temp_dir() . '/ppthelper_test_default.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => '# Default look', 'output' => $out]);
+        ppthelper::render(['content_markdown' => '# Default look', 'output' => $out]);
 
         $zip = new ZipArchive();
-        $zip->open(dirname(__DIR__) . '/assets/skeleton.pptx');
+        $zip->open(dirname(__DIR__) . '/assets/default.pptx');
         $skeleton_theme = $zip->getFromName('ppt/theme/theme1.xml');
         $zip->close();
 
@@ -336,12 +368,12 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_layouts_restored.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# Alpha\n\n- one\n- two\n\n# Beta\n\n:::: {.columns}\n::: {.column}\nleft text\n:::\n::: {.column}\nright text\n:::\n::::",
+            'content_markdown' => "# Alpha\n\n- one\n- two\n\n# Beta\n\n:::: {.columns}\n::: {.column}\nleft text\n:::\n::: {.column}\nright text\n:::\n::::",
             'output' => $out
         ]);
 
         $skeleton_zip = new ZipArchive();
-        $skeleton_zip->open(dirname(__DIR__) . '/assets/skeleton.pptx');
+        $skeleton_zip->open(dirname(__DIR__) . '/assets/default.pptx');
         $output_zip = new ZipArchive();
         $output_zip->open($out);
 
@@ -376,7 +408,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_layouts_keep_theme.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# Themed slide\n\n- bullet",
+            'content_markdown' => "# Themed slide\n\n- bullet",
             'output' => $out,
             'colors_primary' => '#AA22BB'
         ]);
@@ -389,7 +421,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_autofit.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# Slide A\n\n- bullet one\n- bullet two",
+            'content_markdown' => "# Slide A\n\n- bullet one\n- bullet two",
             'output' => $out
         ]);
         $slide1 = self::loadSlideXml($out, 1);
@@ -406,7 +438,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_autofit_title.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "% Title slide\n% Author\n% 21. Mai 2026\n\n# Content slide\n\n- bullet",
+            'content_markdown' => "% Title slide\n% Author\n% 21. Mai 2026\n\n# Content slide\n\n- bullet",
             'output' => $out
         ]);
         // slide1 = title slide. its title shape must NOT have normAutofit.
@@ -424,7 +456,7 @@ class Test extends \PHPUnit\Framework\TestCase
         // two normAutofit tags inside a single placeholder.
         $out = sys_get_temp_dir() . '/ppthelper_test_autofit_idem.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => "# X\n\n- bullet", 'output' => $out]);
+        ppthelper::render(['content_markdown' => "# X\n\n- bullet", 'output' => $out]);
         $slide1 = self::loadSlideXml($out, 1);
         $body_match = preg_match('#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*idx="1"(?:(?!</p:sp>).)*?</p:sp>#s', $slide1, $m);
         $this->assertSame(1, $body_match);
@@ -438,7 +470,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_layouts_keep_slides.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# Headline X\n\n- bullet ONE\n- bullet TWO\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+            'content_markdown' => "# Headline X\n\n- bullet ONE\n- bullet TWO\n\n| a | b |\n|---|---|\n| 1 | 2 |",
             'output' => $out
         ]);
         $zip = new ZipArchive();
@@ -459,7 +491,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_geom_titleslide.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "% Deck Title\n% Author\n% 21. Mai 2026\n\n# Content slide\n\n- bullet",
+            'content_markdown' => "% Deck Title\n% Author\n% 21. Mai 2026\n\n# Content slide\n\n- bullet",
             'output' => $out
         ]);
         $slide1 = self::loadSlideXml($out, 1);
@@ -486,7 +518,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_geom_twocol.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "# Headline\n\n:::: {.columns}\n::: {.column}\n- LEFT_BULLET\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::",
+            'content_markdown' => "# Headline\n\n:::: {.columns}\n::: {.column}\n- LEFT_BULLET\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::",
             'output' => $out
         ]);
         $slide1 = self::loadSlideXml($out, 1);
@@ -509,7 +541,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Table\n\n" . implode("\n", $rows);
         $out = sys_get_temp_dir() . '/ppthelper_test_table_grow.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         $slide1 = self::loadSlideXml($out, 1);
         $gf_match = preg_match(
             '#<p:graphicFrame\b[^>]*>.*?</p:graphicFrame>#s',
@@ -536,7 +568,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "% Deck\n% Author\n% 22. Mai 2026\n\n# Part 1: Foundations\n\n# Slide One\n\n- bullet A\n\n# Slide Two\n\n- bullet B";
         $out = sys_get_temp_dir() . '/ppthelper_test_sechead_remap.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         // slide2 should be the "Part 1: Foundations" section-header candidate.
         $zip = new ZipArchive();
         $zip->open($out);
@@ -557,7 +589,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Real Content\n\n- bullet ONE\n- bullet TWO";
         $out = sys_get_temp_dir() . '/ppthelper_test_sechead_skip.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         $zip = new ZipArchive();
         $zip->open($out);
         $rels = $zip->getFromName('ppt/slides/_rels/slide1.xml.rels');
@@ -576,13 +608,13 @@ class Test extends \PHPUnit\Framework\TestCase
         // When the entire body of a slide is such paragraphs, ppthelper remaps
         // the layout to the skeleton's quote-named layout AND re-anchors the
         // content placeholder to the layout's body-idx (typically 2, not 1).
-        // The bundled assets/skeleton.pptx has no quote layout, so pick the
+        // The bundled assets/default.pptx has no quote layout, so pick the
         // first input skeleton that does.
         $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
             return preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $layout_xml) === 1;
         });
         if ($skeleton === null) {
-            $this->markTestSkipped('no skeleton with quote/zitat layout available in skeleton_input/');
+            $this->markTestSkipped('no skeleton with quote/zitat layout available in assets/');
         }
         // re-read the quote layout's metadata for assertions
         $z = new ZipArchive();
@@ -620,7 +652,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Worth quoting\n\n> Lorem ipsum dolor sit amet.\n>\n> — Cicero, 45 BC";
         $out = sys_get_temp_dir() . '/ppthelper_test_quote_remap.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'style_template' => $skeleton, 'output' => $out]);
         $z = new ZipArchive();
         $z->open($out);
         $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
@@ -654,7 +686,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Content\n- bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_idx_norm.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
 
         $z = new ZipArchive();
         $z->open($out);
@@ -711,12 +743,12 @@ class Test extends \PHPUnit\Framework\TestCase
             return preg_match('#<p:cSld\b[^>]*\bname="[^"]*(zitat|quote)#i', $layout_xml) === 1;
         });
         if ($skeleton === null) {
-            $this->markTestSkipped('no skeleton with quote/zitat layout available in skeleton_input/');
+            $this->markTestSkipped('no skeleton with quote/zitat layout available in assets/');
         }
         $md = "# Quote slide\n\n> Lorem ipsum dolor sit amet.\n>\n> — Author";
         $out = sys_get_temp_dir() . '/ppthelper_test_quote_marl.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'style_template' => $skeleton, 'output' => $out]);
         $slide = self::loadSlideXml($out, 1);
         $this->assertDoesNotMatchRegularExpression(
             '#<a:pPr\b[^/]*\bmarL="1270000"#',
@@ -734,11 +766,11 @@ class Test extends \PHPUnit\Framework\TestCase
         // <p:sp txBox="1"> caption below the picture. On compact slide
         // formats this caption collides with the master footer zone; we
         // strip all free text boxes (no <p:ph>) so the picture stands clean.
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $skeleton = dirname(__DIR__) . '/assets/default.pptx';
         $md = "# Bild\n\n![Governance](" . $skeleton . ")";
         $out = sys_get_temp_dir() . '/ppthelper_test_caption_strip.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         $slide = self::loadSlideXml($out, 1);
         // There must not be a free TextBox shape (txBox="1" without <p:ph>).
         $this->assertDoesNotMatchRegularExpression(
@@ -772,7 +804,7 @@ class Test extends \PHPUnit\Framework\TestCase
             return preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $layout_xml) === 1;
         });
         if ($skeleton === null) {
-            $this->markTestSkipped('no twoObj layout available in skeleton_input/');
+            $this->markTestSkipped('no twoObj layout available in assets/');
         }
         // find left+right body-column geometry from the layout
         $z = new ZipArchive();
@@ -825,7 +857,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Two col\n\n:::: {.columns}\n::: {.column}\n![pic](" . $sample_path . ")\n:::\n::: {.column}\n- right text\n:::\n::::";
         $out = sys_get_temp_dir() . '/ppthelper_test_pic_fit.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'style_template' => $skeleton, 'output' => $out]);
         $slide = self::loadSlideXml($out, 1);
         $this->assertMatchesRegularExpression(
             '#<p:pic\b#',
@@ -860,7 +892,7 @@ class Test extends \PHPUnit\Framework\TestCase
             return preg_match('#<p:sldLayout\b[^>]*\btype="twoObj"#', $layout_xml) === 1;
         });
         if ($skeleton === null) {
-            $this->markTestSkipped('no twoObj layout available in skeleton_input/');
+            $this->markTestSkipped('no twoObj layout available in assets/');
         }
         // collect the two-column layout's left/right body geometries
         $z = new ZipArchive();
@@ -912,7 +944,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Text left, picture right\n\n:::: {.columns}\n::: {.column}\n- LEFT_TEXT_BULLET_A\n- LEFT_TEXT_BULLET_B\n:::\n::: {.column}\n![pic](" . $sample_path . ")\n:::\n::::";
         $out = sys_get_temp_dir() . '/ppthelper_test_pattern_b.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'style_template' => $skeleton, 'output' => $out]);
         $slide = self::loadSlideXml($out, 1);
 
         // (1) the picture must land in the RIGHT column
@@ -960,7 +992,7 @@ class Test extends \PHPUnit\Framework\TestCase
         // (hardcoded x of the left column) + one body placeholder for the
         // bullets. The bullets must be mapped to the layout body in the
         // OTHER column, not the one already occupied by the picture.
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $skeleton = dirname(__DIR__) . '/assets/default.pptx';
         $z = new ZipArchive();
         $z->open($skeleton);
         // find the two-content layout (twoObj) and inspect its bodies
@@ -1000,7 +1032,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Two col with pic\n\n:::: {.columns}\n::: {.column}\n![hero](" . $skeleton . ")\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::";
         $out = sys_get_temp_dir() . '/ppthelper_test_pic_aware.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         $slide = self::loadSlideXml($out, 1);
 
         // The bullets must be in the right-column body (not the same column as the picture)
@@ -1025,7 +1057,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Two cols\n\n:::: {.columns}\n::: {.column}\n- LEFT_BULLET\n:::\n::: {.column}\n- RIGHT_BULLET\n:::\n::::";
         $out = sys_get_temp_dir() . '/ppthelper_test_idx_twocol.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
 
         $z = new ZipArchive();
         $z->open($out);
@@ -1106,7 +1138,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Normal content\n\n- not a quote\n- regular bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_quote_skip.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'style_template' => $skeleton, 'output' => $out]);
         $z = new ZipArchive();
         $z->open($out);
         $rels = $z->getFromName('ppt/slides/_rels/slide1.xml.rels');
@@ -1126,7 +1158,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "% Cover\n% Author\n% 22. Mai 2026\n\n# Content slide\n\n- bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_sldnum.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         $slide1 = self::loadSlideXml($out, 1);
         $slide2 = self::loadSlideXml($out, 2);
         foreach ([$slide1, $slide2] as $slide) {
@@ -1151,10 +1183,10 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "% Cover\n% Author\n% 22. Mai 2026\n\n# Content\n\n- bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_no_ftr.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         // probe the skeleton itself — only assert "no stub" when it really
         // has no payload, otherwise the assertion is meaningless
-        $skeleton = dirname(__DIR__) . '/assets/skeleton.pptx';
+        $skeleton = dirname(__DIR__) . '/assets/default.pptx';
         $z = new ZipArchive();
         $z->open($skeleton);
         $any_ftr_payload = false;
@@ -1199,7 +1231,15 @@ class Test extends \PHPUnit\Framework\TestCase
         //   - the dt box is rotated 90° (rot="5400000")
         //   - the dt box is very narrow (cx < ~1.6")
         // Pick any skeleton whose layout matches one of those signals.
-        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml): bool {
+        // Restrict to slideLayout1.xml (= the title slide) — that's the only
+        // slide ppthelper actually applies the dt-rewrite to. Without this
+        // constraint the predicate could match a body-slide's dt placeholder
+        // (e.g. slideLayout3) and we'd pick a skeleton whose cover has a
+        // wide, static dt — where the rewrite is correctly skipped.
+        $skeleton = self::findSkeletonWithFeature(static function (string $layout_xml, string $layout_name): bool {
+            if ($layout_name !== 'slideLayout1.xml') {
+                return false;
+            }
             if (
                 preg_match(
                     '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
@@ -1225,12 +1265,12 @@ class Test extends \PHPUnit\Framework\TestCase
             return false;
         });
         if ($skeleton === null) {
-            $this->markTestSkipped('no skeleton with a live datetime1 dt-placeholder available — rewrite is a no-op');
+            $this->markTestSkipped('no skeleton with a live/rotated/narrow datetime1 placeholder on the title slide — rewrite is a no-op');
         }
         $md = "% Cover Title\n% Subtitle\n% 22. Mai 2026\n\n# Content\n\n- bullet";
         $out = sys_get_temp_dir() . '/ppthelper_test_dt_live.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'input_template' => $skeleton, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'style_template' => $skeleton, 'output' => $out]);
         $slide1 = self::loadSlideXml($out, 1);
         if (preg_match(
             '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*\btype="dt"(?:(?!</p:sp>).)*?</p:sp>#s',
@@ -1256,7 +1296,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $out = sys_get_temp_dir() . '/ppthelper_test_subtitle.pptx';
         @unlink($out);
         ppthelper::render([
-            'input_markdown' => "% Big Title\n% A Subtitle Here\n% 22. Mai 2026\n\n# Content slide\n\n- bullet",
+            'content_markdown' => "% Big Title\n% A Subtitle Here\n% 22. Mai 2026\n\n# Content slide\n\n- bullet",
             'output' => $out
         ]);
         $slide1 = self::loadSlideXml($out, 1);
@@ -1280,7 +1320,7 @@ class Test extends \PHPUnit\Framework\TestCase
         $md = "# Small\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
         $out = sys_get_temp_dir() . '/ppthelper_test_table_small.pptx';
         @unlink($out);
-        ppthelper::render(['input_markdown' => $md, 'output' => $out]);
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
         $slide1 = self::loadSlideXml($out, 1);
         if (preg_match('#<p:graphicFrame\b[^>]*>.*?</p:graphicFrame>#s', $slide1, $gfm) !== 1) {
             $this->markTestSkipped('Pandoc rendered no table for this markdown');
@@ -1296,8 +1336,8 @@ class Test extends \PHPUnit\Framework\TestCase
      * Renders one realistic charly-style deck (~21 slides, all reachable
      * layouts: cover, agenda, section-headers, content with bullets/tables,
      * two-column with image, quote, image-only, speaker-notes) against every
-     * skeleton in `tests/skeleton_input/` and writes the result to
-     * `tests/skeleton_output/`. The output is a manual-review fixture — the
+     * skeleton in `assets/` and writes the result to
+     * `tests/output/`. The output is a manual-review fixture — the
      * test only sanity-checks file existence + slide count, the actual visual
      * comparison happens by the reviewer opening each .pptx in PowerPoint.
      */
@@ -1305,7 +1345,7 @@ class Test extends \PHPUnit\Framework\TestCase
     {
         // This is a fixture-generator for human review, not a behavior check.
         // It renders one ~21-slide sample deck through every skeleton in
-        // `tests/skeleton_input/` and dumps the result to `skeleton_output/`
+        // `assets/` and dumps the result to `output/`
         // so a reviewer can visually compare looks across templates.
         // In CI we skip it — 32 sequential pandoc runs + post-process passes
         // exhaust the macOS-runner's memory budget (SIGKILL mid-suite), and
@@ -1313,10 +1353,10 @@ class Test extends \PHPUnit\Framework\TestCase
         if (getenv('CI') === 'true' || ($_SERVER['CI'] ?? '') === 'true' || getenv('GITHUB_ACTIONS') === 'true') {
             $this->markTestSkipped('skeleton-batch render is a local visual-review fixture, skipped on CI');
         }
-        $input_dir = dirname(__DIR__) . '/tests/skeleton_input';
-        $output_dir = dirname(__DIR__) . '/tests/skeleton_output';
+        $input_dir = dirname(__DIR__) . '/assets';
+        $output_dir = dirname(__DIR__) . '/tests/output';
         if (!is_dir($input_dir)) {
-            $this->markTestSkipped('skeleton_input directory missing — drop *.pptx files in there first');
+            $this->markTestSkipped('assets directory missing — drop *.pptx files in there first');
         }
         // glob *.pptx but skip Office lock-files (~$skeleton01.pptx is
         // created while a deck is open in PowerPoint and matches *.pptx too)
@@ -1325,10 +1365,10 @@ class Test extends \PHPUnit\Framework\TestCase
             static fn(string $p): bool => !str_starts_with(basename($p), '~$')
         ));
         if ($skeletons === []) {
-            $this->markTestSkipped('no skeletons in tests/skeleton_input/');
+            $this->markTestSkipped('no skeletons in assets/');
         }
         if (!is_dir($output_dir) && !mkdir($output_dir, 0775, true) && !is_dir($output_dir)) {
-            $this->fail('failed to create tests/skeleton_output');
+            $this->fail('failed to create tests/output');
         }
         // wipe previous review outputs so a reviewer never opens a stale file
         // from a previous run. leave Office lock-files (~$...) alone — the
@@ -1366,8 +1406,8 @@ class Test extends \PHPUnit\Framework\TestCase
             $out = $output_dir . '/' . $stem . '.pptx';
             try {
                 ppthelper::render([
-                    'input_markdown' => $md,
-                    'input_template' => $skeleton,
+                    'content_markdown' => $md,
+                    'style_template' => $skeleton,
                     'output' => $out,
                 ]);
             } catch (\Throwable $e) {
