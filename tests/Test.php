@@ -433,6 +433,45 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__autofit_added_to_two_column_right_body(): void
+    {
+        // regression for chat 019e5e11-281a: two-column layout (Pandoc emits
+        // `<p:ph idx="2" sz="half"/>` for the right body) was being skipped by
+        // the autofit pass because the predicate only matched idx="1". Without
+        // normAutofit the right column overflows the slide when the text is
+        // longer than the layout-default body height.
+        $out = sys_get_temp_dir() . '/ppthelper_test_autofit_twocol.pptx';
+        @unlink($out);
+        // Pandoc two-column fence with image left + bullets right
+        $img = sys_get_temp_dir() . '/ppthelper_test_dummy.png';
+        // 1x1 transparent PNG
+        file_put_contents($img, base64_decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII='
+        ));
+        $md = "::: {.columns}\n::: {.column width=\"50%\"}\n![](" . $img . ")\n:::\n::: {.column width=\"50%\"}\n# Right title\n\n- a\n- b\n- c\n:::\n:::";
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);
+        // every non-system <p:ph> with idx="N" (N in 1..9) MUST end up with a
+        // <a:normAutofit/> in its bodyPr.
+        $matched_any = false;
+        foreach (range(1, 9) as $idx) {
+            $regex = '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*idx="' . $idx . '"(?:(?!</p:sp>).)*?</p:sp>#s';
+            if (preg_match($regex, $slide1, $m) === 1) {
+                // skip system placeholder types
+                if (preg_match('#type="(?:sldNum|dt|ftr|hdr|pic)"#', $m[0]) === 1) {
+                    continue;
+                }
+                $matched_any = true;
+                $this->assertStringContainsString(
+                    '<a:normAutofit',
+                    $m[0],
+                    'body placeholder idx="' . $idx . '" must have <a:normAutofit/>'
+                );
+            }
+        }
+        $this->assertTrue($matched_any, 'rendered two-column slide should have at least one indexed body placeholder');
+    }
+
     public function test__autofit_skips_title_placeholders(): void
     {
         $out = sys_get_temp_dir() . '/ppthelper_test_autofit_title.pptx';

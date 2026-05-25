@@ -499,8 +499,15 @@ class ppthelper
                         }
                         $ph_attrs = $ph_m[1];
                         $type = preg_match('#\btype="([^"]+)"#', $ph_attrs, $tm) === 1 ? $tm[1] : '';
-                        $has_idx_1 = preg_match('#\bidx="1"#', $ph_attrs) === 1;
-                        $is_body = in_array($type, ['body', 'obj'], true) || ($type === '' && $has_idx_1);
+                        // system placeholders never get autofit — their content is metadata.
+                        if (in_array($type, ['sldNum', 'dt', 'ftr', 'hdr', 'pic'], true)) {
+                            return $sp;
+                        }
+                        $has_idx = preg_match('#\bidx="\d+"#', $ph_attrs) === 1;
+                        // body match: explicit body/obj type, OR no type with any idx (idx="1"
+                        // = single body, idx="2"/"3"/... = two-column / multi-content slots,
+                        // which are also body placeholders that need text shrinking).
+                        $is_body = in_array($type, ['body', 'obj'], true) || ($type === '' && $has_idx);
                         if (!$is_body) {
                             return $sp;
                         }
