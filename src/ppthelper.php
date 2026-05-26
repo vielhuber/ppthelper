@@ -201,6 +201,15 @@ class ppthelper
         // belongs to (closest column center, aspect-ratio preserved).
         self::fitPicturesToLayoutColumns($output);
 
+        // After picture-fit: balance vertical anchor between picture and
+        // sibling text column. Picture is centered-on-short-axis (so a
+        // 16:9 pic in a near-square column floats vertically in its column);
+        // body text defaults to top-aligned. Visually the two columns then
+        // look "off" — pic floats, text clings to top. Anchor body text
+        // vertically centered too whenever the slide contains a <p:pic> AND
+        // a body placeholder, so both columns share the same vertical center.
+        self::balanceTwoColumnAnchor($output);
+
         // Pandoc emits each slide with only title/body/date placeholders.
         // Skeleton layouts often also contain sldNum and ftr placeholders —
         // when those don't exist in the slide itself, PowerPoint falls back
@@ -1069,6 +1078,78 @@ class ppthelper
      * placeholders (then there's no column structure to fit into and Pandoc's
      * default geometry is fine).
      */
+    /**
+     * For slides that contain both a <p:pic> AND at least one non-title
+     * body placeholder, set anchor="ctr" on the body placeholder(s) so the
+     * text vertically centers within its column. Without this the picture
+     * is vertically centered (per fitPicturesToLayoutColumns) while the
+     * text top-aligns — the columns look misaligned. With anchor="ctr"
+     * both columns share the same vertical center line.
+     *
+     * Only touches slides that actually have a <p:pic>, so single-column
+     * text-only slides keep the default top-anchor business look.
+     */
+    private static function balanceTwoColumnAnchor(string $output_path): void
+    {
+        $zip = new ZipArchive();
+        if ($zip->open($output_path) !== true) {
+            throw new RuntimeException('ppthelper::render: failed to open output for two-column anchor balance: ' . $output_path);
+        }
+        try {
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $name = $zip->getNameIndex($i);
+                if (!is_string($name) || preg_match('#^ppt/slides/slide\d+\.xml$#', $name) !== 1) {
+                    continue;
+                }
+                $xml = $zip->getFromIndex($i);
+                if (!is_string($xml) || strpos($xml, '<p:pic') === false) {
+                    continue;
+                }
+                $new_xml = preg_replace_callback(
+                    '#<p:sp\b[^>]*>.*?</p:sp>#s',
+                    static function (array $m): string {
+                        $sp = $m[0];
+                        if (preg_match('#<p:ph\b[^/]*\btype="(?:title|ctrTitle|subTitle|dt|ftr|sldNum)"#', $sp) === 1) {
+                            return $sp;
+                        }
+                        if (preg_match('#<p:ph\b#', $sp) !== 1) {
+                            return $sp;
+                        }
+                        // already has anchor="ctr" → don't touch
+                        if (preg_match('#<a:bodyPr\b[^/>]*\banchor="ctr"#', $sp) === 1) {
+                            return $sp;
+                        }
+                        // self-closing bodyPr → expand and inject anchor attr
+                        $patched = preg_replace(
+                            '#<a:bodyPr(\s[^/>]*)?\s*/>#',
+                            '<a:bodyPr$1 anchor="ctr"/>',
+                            $sp,
+                            1
+                        );
+                        if ($patched === $sp) {
+                            // open-tag bodyPr → inject anchor attr inside the opening tag
+                            $patched = preg_replace(
+                                '#<a:bodyPr(\s[^>]*)?>#',
+                                '<a:bodyPr$1 anchor="ctr">',
+                                $sp,
+                                1
+                            );
+                        }
+                        return $patched ?? $sp;
+                    },
+                    $xml
+                );
+                if (!is_string($new_xml) || $new_xml === $xml) {
+                    continue;
+                }
+                $zip->deleteName($name);
+                $zip->addFromString($name, $new_xml);
+            }
+        } finally {
+            $zip->close();
+        }
+    }
+
     private static function fitPicturesToLayoutColumns(string $output_path): void
     {
         $zip = new ZipArchive();

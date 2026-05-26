@@ -433,6 +433,31 @@ class Test extends \PHPUnit\Framework\TestCase
         );
     }
 
+    public function test__two_column_body_anchored_center_when_picture_present(): void
+    {
+        // regression for chat 019e5ead-019d (minecraft deck): a 16:9 picture in
+        // a near-square two-column body floats centered in its column, while
+        // the sibling text column top-aligns. Visually the columns look
+        // misaligned. balanceTwoColumnAnchor sets anchor="ctr" on body
+        // placeholders in slides that contain a <p:pic>, so the text shares
+        // the picture's vertical center.
+        $out = sys_get_temp_dir() . '/ppthelper_test_anchor_ctr.pptx';
+        @unlink($out);
+        $img = sys_get_temp_dir() . '/ppthelper_test_anchor_ctr.png';
+        file_put_contents($img, base64_decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII='
+        ));
+        $md = "::: {.columns}\n::: {.column width=\"50%\"}\n![](" . $img . ")\n:::\n::: {.column width=\"50%\"}\n# Right title\n\n- a\n- b\n:::\n:::";
+        ppthelper::render(['content_markdown' => $md, 'output' => $out]);
+        $slide1 = self::loadSlideXml($out, 1);
+        // body sp must have anchor="ctr"
+        $this->assertMatchesRegularExpression(
+            '#<p:sp\b[^>]*>(?:(?!</p:sp>).)*?<p:ph\b[^/]*idx="(?:1|2|3)"(?:(?!</p:sp>).)*?<a:bodyPr\b[^/>]*\banchor="ctr"#s',
+            $slide1,
+            'body placeholder must have anchor="ctr" on slides with a picture'
+        );
+    }
+
     public function test__autofit_added_to_two_column_right_body(): void
     {
         // regression for chat 019e5e11-281a: two-column layout (Pandoc emits
