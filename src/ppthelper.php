@@ -88,6 +88,16 @@ class ppthelper
             $output = tempnam(sys_get_temp_dir(), 'ppthelper_') . '.pptx';
         } elseif (!is_string($output)) {
             throw new RuntimeException('ppthelper::render: option "output" must be a string path.');
+        } else {
+            // render_deck always produces a .pptx, so confine the write to that: reject
+            // path traversal / null bytes and any non-.pptx target. This stops a caller
+            // (e.g. via prompt injection) from clobbering configs/scripts/.env/cron files.
+            if (str_contains($output, "\0") || preg_match('~(^|/)\.\.(/|$)~', $output) === 1) {
+                throw new RuntimeException('ppthelper::render: option "output" must not contain path traversal.');
+            }
+            if (strtolower(substr($output, -5)) !== '.pptx') {
+                throw new RuntimeException('ppthelper::render: option "output" must be a .pptx file.');
+            }
         }
         // Resolve relative output against the caller's cwd so the eventual
         // path-on-disk matches what was passed in, not pandoc's cwd.
