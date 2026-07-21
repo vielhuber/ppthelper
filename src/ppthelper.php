@@ -259,7 +259,7 @@ class ppthelper
      * @param string|null $transitions Slide transition applied to every slide. One of: null (none), "fade", "slide".
      * @param bool|null $animations When true, body bullets appear one click at a time (PowerPoint "Appear → By Paragraph").
      * @param string|null $output Output path. Relative paths resolve against the caller's cwd. If null, a tempfile is used and its path returned.
-     * @return array{path: string} Path to the generated .pptx file.
+     * @return array{path: string, slide_count: int} Path and verified slide count of the generated .pptx file.
      */
     #[McpTool(name: 'render_deck')]
     public function renderDeck(
@@ -282,7 +282,10 @@ class ppthelper
             'transitions' => $transitions !== null && $transitions !== '' ? $transitions : false,
             'animations' => (bool) ($animations ?? false)
         ]);
-        return ['path' => $path];
+        return [
+            'path' => $path,
+            'slide_count' => self::validateOutput($path)
+        ];
     }
 
     // ====================================================================
@@ -367,7 +370,7 @@ class ppthelper
      * least one slide and the theme XML. Catches half-written or corrupted
      * output that a simple filesize check would miss.
      */
-    private static function validateOutput(string $path): void
+    private static function validateOutput(string $path): int
     {
         if (!is_file($path)) {
             throw new RuntimeException('ppthelper::render: output file missing after pandoc: ' . $path);
@@ -396,6 +399,7 @@ class ppthelper
         if (!$has_theme) {
             throw new RuntimeException('ppthelper::render: output is missing ppt/theme/theme1.xml — file is not a valid PowerPoint deck.');
         }
+        return $slide_count;
     }
 
     private static function runPandoc(string $pandoc_path, string $md_source, string $themed_ref, string $out_path, string $cwd): void

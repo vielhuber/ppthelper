@@ -138,6 +138,18 @@ class Test extends \PHPUnit\Framework\TestCase
         $this->assertStringContainsString('<a:t>one</a:t>', $slide1);
     }
 
+    public function test__mcp_render_returns_verified_slide_count(): void
+    {
+        $out = sys_get_temp_dir() . '/ppthelper_test_mcp_result.pptx';
+        @unlink($out);
+        $result = (new ppthelper())->renderDeck(
+            markdown: "# First slide\n\nContent.\n\n# Second slide\n\nContent.",
+            output: $out
+        );
+        $this->assertSame($out, $result['path']);
+        $this->assertSame(2, $result['slide_count']);
+    }
+
     public function test__theming_propagates(): void
     {
         $out = sys_get_temp_dir() . '/ppthelper_test_theme.pptx';
