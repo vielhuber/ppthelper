@@ -255,6 +255,8 @@ class ppthelper
      *     standard Pandoc-Markdown.
      *
      * @param string $markdown The complete deck as one Pandoc-Markdown blob.
+     * @param int $minimum_slide_count Minimum accepted slide count for the rendered deck.
+     * @param int $maximum_slide_count Maximum accepted slide count for the rendered deck.
      * @param string|null $style_template Selects the deck's visual style. `null` or `"default"` uses the bundled default look; any other slug like `"ion"`, `"facet"`, `"circuit"`, `"slate"`, `"droplet"`, `"banded"`, `"berlin"`, `"badge"`, `"basis"`, `"frame"`, `"wisp"`, `"dividend"`, `"damask"`, `"gallery"`, `"headlines"`, `"integral"`, `"mesh"`, `"metropolitan"`, `"office-classic"`, `"organic"`, `"parcel"`, `"quotable"`, `"retrospect"`, `"segment"`, `"slice"`, `"vapor-trail"`, `"wood-type"`, `"ion-boardroom"` picks the bundled style with that name. See README for the full list.
      * @param string|null $transitions Slide transition applied to every slide. One of: null (none), "fade", "slide".
      * @param bool|null $animations When true, body bullets appear one click at a time (PowerPoint "Appear → By Paragraph").
@@ -264,11 +266,16 @@ class ppthelper
     #[McpTool(name: 'render_deck')]
     public function renderDeck(
         string $markdown,
+        int $minimum_slide_count,
+        int $maximum_slide_count,
         ?string $style_template = null,
         ?string $transitions = null,
         ?bool $animations = null,
         ?string $output = null
     ): array {
+        if ($minimum_slide_count < 1 || $maximum_slide_count < $minimum_slide_count) {
+            throw new RuntimeException('Slide count limits must be positive and ordered from minimum to maximum.');
+        }
         // Color/font theme parameters are intentionally NOT exposed through the
         // MCP interface — LLMs reflexively fill them with a generic "modern
         // default" palette, overwriting the curated style. To switch the look,
@@ -282,9 +289,23 @@ class ppthelper
             'transitions' => $transitions !== null && $transitions !== '' ? $transitions : false,
             'animations' => (bool) ($animations ?? false)
         ]);
+        $slide_count = self::validateOutput($path);
+        if ($slide_count < $minimum_slide_count || $slide_count > $maximum_slide_count) {
+            if (is_file($path)) {
+                unlink($path);
+            }
+            throw new RuntimeException(
+                sprintf(
+                    'Rendered deck has %d slides, but the required range is %d to %d. Correct the complete Markdown and render the same output path again.',
+                    $slide_count,
+                    $minimum_slide_count,
+                    $maximum_slide_count
+                )
+            );
+        }
         return [
             'path' => $path,
-            'slide_count' => self::validateOutput($path)
+            'slide_count' => $slide_count
         ];
     }
 
@@ -410,7 +431,15 @@ class ppthelper
         // additionally makes any other relative refs (e.g. include-files)
         // behave the same way. Absolute paths in the markdown work
         // regardless.
-        $cmd = [$pandoc_path, '--reference-doc=' . $themed_ref, '--resource-path=' . $cwd, '-o', $out_path, $md_source];
+        $cmd = [
+            $pandoc_path,
+            '--slide-level=1',
+            '--reference-doc=' . $themed_ref,
+            '--resource-path=' . $cwd,
+            '-o',
+            $out_path,
+            $md_source
+        ];
 
         // proc_open with an argv array bypasses the shell — no escaping needed.
         $proc = proc_open(

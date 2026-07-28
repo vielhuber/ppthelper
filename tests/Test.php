@@ -138,16 +138,53 @@ class Test extends \PHPUnit\Framework\TestCase
         $this->assertStringContainsString('<a:t>one</a:t>', $slide1);
     }
 
+    public function test__level_two_headings_do_not_create_additional_slides(): void
+    {
+        $out = sys_get_temp_dir() . '/ppthelper_test_heading_levels.pptx';
+        if (is_file($out)) {
+            unlink($out);
+        }
+        ppthelper::render([
+            'content_markdown' => "% Deck title\n% Author\n% Date\n\n# First slide\n\n## First section\n\nContent.\n\n# Second slide\n\n## Second section\n\nContent.",
+            'output' => $out
+        ]);
+        $this->assertSame(3, self::countSlides($out));
+        $this->assertStringContainsString('First section', self::loadSlideXml($out, 2));
+        $this->assertStringContainsString('Second section', self::loadSlideXml($out, 3));
+    }
+
     public function test__mcp_render_returns_verified_slide_count(): void
     {
         $out = sys_get_temp_dir() . '/ppthelper_test_mcp_result.pptx';
         @unlink($out);
         $result = (new ppthelper())->renderDeck(
             markdown: "# First slide\n\nContent.\n\n# Second slide\n\nContent.",
+            minimum_slide_count: 2,
+            maximum_slide_count: 2,
             output: $out
         );
         $this->assertSame($out, $result['path']);
         $this->assertSame(2, $result['slide_count']);
+    }
+
+    public function test__mcp_render_rejects_output_outside_slide_count_limits(): void
+    {
+        $out = sys_get_temp_dir() . '/ppthelper_test_mcp_slide_limits.pptx';
+        if (is_file($out)) {
+            unlink($out);
+        }
+        try {
+            (new ppthelper())->renderDeck(
+                markdown: "# First slide\n\nContent.\n\n# Second slide\n\nContent.",
+                minimum_slide_count: 3,
+                maximum_slide_count: 3,
+                output: $out
+            );
+            $this->fail('Expected the slide count validation to reject the deck.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('required range is 3 to 3', $exception->getMessage());
+        }
+        $this->assertFileDoesNotExist($out);
     }
 
     public function test__theming_propagates(): void

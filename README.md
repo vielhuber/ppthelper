@@ -102,6 +102,8 @@ slideLayouts retained):
 
 ppthelper accepts any [pandoc-flavored markdown](https://pandoc.org/MANUAL.html#slide-shows):
 
+Each `#` heading starts a slide. Nested `##` headings remain content on that slide and never create additional slides.
+
 ```markdown
 % Deck title
 % author
@@ -373,6 +375,6 @@ vendor/bin/mcp-server.php
 
 the server speaks both stdio (CLI invocation) and HTTP via [simplemcp](https://github.com/vielhuber/simplemcp). `auth: 'static'` mode expects the bearer token in `MCP_TOKEN`.
 
-the tool exposes `render_deck(markdown, style_template?, transitions?, animations?, output?)`. `style_template` accepts any of the bundled slugs (`'ion'`, `'facet'`, `'circuit'`, …; see "styles" above) — let the LLM pick a look that matches the deck topic. color/font theme overrides are intentionally **not** part of the mcp surface — llms otherwise reflexively replace the curated theme with a generic "modern" palette. for hard-forced theming use `ppthelper::render(...)` directly from php or the cli.
+the tool exposes `render_deck(markdown, minimum_slide_count, maximum_slide_count, style_template?, transitions?, animations?, output?)`. The required count limits are checked against the generated PPTX; an out-of-range deck is removed and returned as a tool error. `style_template` accepts any of the bundled slugs (`'ion'`, `'facet'`, `'circuit'`, …; see "styles" above) — let the LLM pick a look that matches the deck topic. color/font theme overrides are intentionally **not** part of the mcp surface — llms otherwise reflexively replace the curated theme with a generic "modern" palette. for hard-forced theming use `ppthelper::render(...)` directly from php or the cli.
 
 `output` accepts any absolute or relative path; relative paths resolve against the working directory the server was launched from. omit it to get a tempfile back. the result contains both `path` and the verified `slide_count` read from the generated pptx archive.
