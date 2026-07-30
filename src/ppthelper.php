@@ -296,7 +296,7 @@ class ppthelper
             }
             throw new RuntimeException(
                 sprintf(
-                    'Rendered deck has %d slides, but the required range is %d to %d. Correct the complete Markdown and render the same output path again.',
+                    'Rendered deck has %d slides, but the required range is %d to %d. Pandoc can create continuation slides when a heading contains a table or image followed by separate body content. Keep each heading in one supported layout, then render the complete Markdown to the same output path again.',
                     $slide_count,
                     $minimum_slide_count,
                     $maximum_slide_count
